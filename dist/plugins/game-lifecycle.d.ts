@@ -1,0 +1,56 @@
+import type { IPlugin, SensorswaveSendEvent } from '../types';
+import type { IPlatformAdapter } from '../platform/interface';
+import { Store } from '../basic/store';
+import { Send } from '../basic/send';
+import { PresetProperties } from '../basic/preset-props';
+export interface GameLifecycleOpts {
+    store: Store;
+    send: Send;
+    presetProps: PresetProperties;
+    autoCapture: boolean;
+    ccGame: any;
+    platformAdapter: IPlatformAdapter;
+    enqueueEvent: (event: SensorswaveSendEvent) => void;
+    flushImmediate: () => void;
+    enableShareTrack?: boolean;
+}
+export declare class GameLifecyclePlugin implements IPlugin {
+    static NAME: string;
+    NAME: string;
+    private _store;
+    private _send;
+    private _autoCapture;
+    private _ccGame;
+    private _platformAdapter;
+    private _enableShareTrack;
+    private _startTimestamp;
+    private _pageShowTimestamp;
+    private _onShowHandler;
+    private _onHideHandler;
+    private _onShareHandler;
+    private _enqueueEvent;
+    private _flushImmediate;
+    private _destroyed;
+    private _initTimer;
+    constructor(opts: GameLifecycleOpts);
+    init(): void;
+    private _initAppLifecycle;
+    private _initMinigameLifecycle;
+    private _initH5Lifecycle;
+    private _scheduleH5PageEvents;
+    private _handleShow;
+    private _handleHide;
+    private _trackAppInstall;
+    private _handleAppShow;
+    private _handleAppHide;
+    private _extractLaunchProps;
+    private _trackMPLaunch;
+    private _handleMPShow;
+    private _handleMPHide;
+    private _trackH5PageView;
+    private _scheduleH5PageLoad;
+    private _trackH5PageLoad;
+    private _handleH5PageLeave;
+    private _initShareTracking;
+    destroy(): void;
+}

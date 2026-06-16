@@ -1,0 +1,17 @@
+{
+  "name": "@sensorswave/cocoscreator-sdk",
+  "version": "1.0.1",
+  "description": "SensorsWave Cocos Creator Data Tracking SDK",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "type": "module",
+  "files": [
+    "dist",
+    "README.md",
+    "native/ios/SensorsWaveBridge.mm",
+    "native/android/SensorsWaveBridge.java",
+    "native/android-2.x/SensorsWaveBridge.java",
+    "native/harmonyos/SensorsWaveBridge.ets"
+  ],
+  "license": "Apache-2.0"
+}
