@@ -1,6 +1,6 @@
 {
   "name": "@sensorswave/cocoscreator-sdk",
-  "version": "1.0.1",
+  "version": "1.0.2",
   "description": "SensorsWave Cocos Creator Data Tracking SDK",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",

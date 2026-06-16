@@ -1,4 +1,4 @@
-const SDK_VERSION = '1.0.0';
+const SDK_VERSION = '1.0.2';
 
 const DEFAULT_CONFIG = {
     debug: false,
@@ -3004,4 +3004,3 @@ class Sensorswave {
 const sensorswave = new Sensorswave();
 
 export { Sensorswave, sensorswave as default };
-//# sourceMappingURL=index.js.map
