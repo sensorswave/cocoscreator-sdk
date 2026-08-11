@@ -1,4 +1,4 @@
-const SDK_VERSION = '1.0.2';
+const SDK_VERSION = '1.1.0';
 
 const DEFAULT_CONFIG = {
     debug: false,
@@ -9,6 +9,8 @@ const DEFAULT_CONFIG = {
     enableAB: false,
     abRefreshInterval: 600000,
     enableShareTrack: true,
+    optOutCapturing: false,
+    persistOptOut: false,
 };
 const CONSTANTS = {
     MAX_QUEUE_SIZE: 200,
@@ -18,6 +20,8 @@ const CONSTANTS = {
     LOGIN_ID_KEY: 'sw_login_id',
     AB_DATA_KEY: 'sw_ab_data',
     LAUNCHED_KEY: 'sw_launched',
+    OPT_OUT_KEY: 'sw_opt_out',
+    INSTALL_TIME_KEY: 'sw_install_time',
     AB_CACHE_TTL: 10 * 60 * 1000,
     MIN_AB_REFRESH_INTERVAL: 30 * 1000,
     PRESET_PROPS_CACHE_DURATION: 60000,
@@ -287,6 +291,22 @@ class Store {
     isLaunched() {
         return this._storage.getItem(CONSTANTS.LAUNCHED_KEY) === '1';
     }
+    getInstallTime() {
+        const raw = this._storage.getItem(CONSTANTS.INSTALL_TIME_KEY);
+        if (!raw)
+            return null;
+        const n = Number(raw);
+        return Number.isFinite(n) ? n : null;
+    }
+    setInstallTime(ts) {
+        this._storage.setItem(CONSTANTS.INSTALL_TIME_KEY, String(ts));
+    }
+    setOptOut(optedOut) {
+        this._storage.setItem(CONSTANTS.OPT_OUT_KEY, optedOut ? '1' : '0');
+    }
+    isOptedOut() {
+        return this._storage.getItem(CONSTANTS.OPT_OUT_KEY) === '1';
+    }
 }
 
 class PersistentQueue {
@@ -401,6 +421,8 @@ class BatchSender {
         this._flushTimer = null;
         this._isFlushing = false;
         this._destroyed = false;
+        this._paused = false;
+        this._started = false;
         this._queue = queue;
         this._requestFn = requestFn;
         this._maxBatchSize = maxBatchSize;
@@ -409,7 +431,25 @@ class BatchSender {
     start() {
         if (this._destroyed)
             return;
+        this._started = true;
         this._startFlushTimer();
+    }
+    pause() {
+        if (this._destroyed)
+            return;
+        this._paused = true;
+        this._clearFlushTimer();
+    }
+    resume() {
+        if (this._destroyed)
+            return;
+        if (!this._paused)
+            return;
+        this._paused = false;
+        this._isFlushing = false;
+        if (this._started) {
+            this._startFlushTimer();
+        }
     }
     add() {
         if (this._destroyed)
@@ -422,7 +462,7 @@ class BatchSender {
         }
     }
     triggerFlush() {
-        if (this._isFlushing || this._destroyed) {
+        if (this._isFlushing || this._destroyed || this._paused) {
             return;
         }
         this._clearFlushTimer();
@@ -504,6 +544,8 @@ class BatchSender {
         this._destroyed = true;
         this._clearFlushTimer();
         this._isFlushing = false;
+        this._paused = false;
+        this._started = false;
     }
 }
 
@@ -1031,6 +1073,9 @@ class NativeBridge {
             if (v)
                 result.brand = v;
         }
+        if (injectedAppInfo.installTime != null) {
+            result.installTime = injectedAppInfo.installTime;
+        }
         return result;
     }
     _readInjectedAppInfo() {
@@ -1042,6 +1087,7 @@ class NativeBridge {
             model: '',
             brand: '',
             manufacturer: '',
+            installTime: null,
         };
         try {
             const g = globalThis;
@@ -1053,6 +1099,13 @@ class NativeBridge {
             ]) {
                 const v = g[key];
                 if (v && typeof v === 'object') {
+                    const rawInstall = v.installTime;
+                    const rawFirst = v.firstInstallTime;
+                    const installTime = typeof rawInstall === 'number' && Number.isFinite(rawInstall)
+                        ? rawInstall
+                        : typeof rawFirst === 'number' && Number.isFinite(rawFirst)
+                            ? rawFirst
+                            : null;
                     return {
                         appId: v.appId || v.bundleId || v.packageName || '',
                         appName: v.appName || v.name || '',
@@ -1061,6 +1114,7 @@ class NativeBridge {
                         model: v.model || v.deviceModel || '',
                         brand: v.brand || v.deviceBrand || '',
                         manufacturer: v.manufacturer || v.deviceManufacturer || v.vendor || '',
+                        installTime,
                     };
                 }
             }
@@ -1103,6 +1157,7 @@ class NativeBridge {
             model: info.model || sys.model,
             osVersion: info.osVersion || sys.osVersion,
             region: info.region || sys.region,
+            installTime: info.installTime ?? sys.installTime,
         };
     }
     _readFromSys() {
@@ -1502,6 +1557,10 @@ class AppPlatformAdapter {
         }
         return {};
     }
+    getInstallTime() {
+        const t = this._nativeBridge.getDeviceInfoSync().installTime;
+        return typeof t === 'number' && t > 0 ? t : null;
+    }
     _resolveScreenWidth() {
         const fromSys = Number(this._sys.screenWidth);
         if (fromSys > 0)
@@ -1568,6 +1627,7 @@ function normalizeMPNetworkType(networkType) {
 class MPPlatformAdapter {
     constructor(sys, getSceneName) {
         this._systemInfo = null;
+        this._accountInfo = null;
         this._asyncNetworkType = '';
         this._asyncNetworkCacheTime = 0;
         this._asyncNetworkInflight = false;
@@ -1578,6 +1638,14 @@ class MPPlatformAdapter {
             const sdk = getMPSDK();
             if (sdk && typeof sdk.getSystemInfoSync === 'function') {
                 this._systemInfo = sdk.getSystemInfoSync();
+            }
+        }
+        catch {
+        }
+        try {
+            const sdk = getMPSDK();
+            if (sdk && typeof sdk.getAccountInfoSync === 'function') {
+                this._accountInfo = sdk.getAccountInfoSync();
             }
         }
         catch {
@@ -1689,6 +1757,9 @@ class MPPlatformAdapter {
         }
         props.$timezone_offset = -new Date().getTimezoneOffset() * 60;
         props.$network_type = this._resolveNetworkType();
+        const mpInfo = this._accountInfo?.miniProgram;
+        props.$app_id = mpInfo?.appId || '';
+        props.$app_version = mpInfo?.version || '';
         props.$url_path = '';
         props.$url_query = '';
         props.$referrer = '';
@@ -2064,6 +2135,7 @@ class GameLifecyclePlugin {
         this._enableShareTrack = !!opts.enableShareTrack;
         this._enqueueEvent = opts.enqueueEvent;
         this._flushImmediate = opts.flushImmediate;
+        this._isOptedOut = opts.isOptedOut ?? (() => false);
     }
     init() {
         if (!this._autoCapture)
@@ -2101,13 +2173,15 @@ class GameLifecyclePlugin {
     _initAppLifecycle() {
         if (!this._store.isLaunched()) {
             this._trackAppInstall();
-            this._store.setLaunched();
+            if (!this._isOptedOut()) {
+                this._store.setLaunched();
+            }
         }
         this._handleShow();
     }
     _initMinigameLifecycle() {
         this._trackMPLaunch();
-        if (!this._store.isLaunched()) {
+        if (!this._store.isLaunched() && !this._isOptedOut()) {
             this._store.setLaunched();
         }
         this._handleMPShow();
@@ -2167,15 +2241,29 @@ class GameLifecyclePlugin {
         }
     }
     _trackAppInstall() {
-        const event = this._send.sendEvent('$AppInstall');
+        if (this._isOptedOut())
+            return;
+        const nativeInstallTime = this._platformAdapter.getInstallTime?.() ?? null;
+        const persistedInstallTime = this._store.getInstallTime();
+        const installTime = nativeInstallTime ?? persistedInstallTime ?? Date.now();
+        if (persistedInstallTime == null) {
+            this._store.setInstallTime(installTime);
+        }
+        const event = this._send.sendEvent('$AppInstall', {
+            $install_time: new Date(installTime).toISOString(),
+        });
         this._enqueueEvent(event);
     }
     _handleAppShow() {
+        if (this._isOptedOut())
+            return;
         this._startTimestamp = Date.now();
         const event = this._send.sendEvent('$AppStart');
         this._enqueueEvent(event);
     }
     _handleAppHide() {
+        if (this._isOptedOut())
+            return;
         const duration = this._startTimestamp > 0 ? Math.floor((Date.now() - this._startTimestamp) / 1000) : 0;
         const event = this._send.sendEvent('$AppEnd', {
             $event_duration: duration,
@@ -2198,15 +2286,21 @@ class GameLifecyclePlugin {
         return props;
     }
     _trackMPLaunch() {
+        if (this._isOptedOut())
+            return;
         const event = this._send.sendEvent('$MPLaunch', this._extractLaunchProps());
         this._enqueueEvent(event);
     }
     _handleMPShow() {
+        if (this._isOptedOut())
+            return;
         this._startTimestamp = Date.now();
         const event = this._send.sendEvent('$MPShow', this._extractLaunchProps());
         this._enqueueEvent(event);
     }
     _handleMPHide() {
+        if (this._isOptedOut())
+            return;
         const duration = this._startTimestamp > 0 ? Math.floor((Date.now() - this._startTimestamp) / 1000) : 0;
         const event = this._send.sendEvent('$MPHide', {
             $event_duration: duration,
@@ -2215,6 +2309,8 @@ class GameLifecyclePlugin {
         this._flushImmediate();
     }
     _trackH5PageView() {
+        if (this._isOptedOut())
+            return;
         const event = this._send.sendEvent('$PageView');
         this._enqueueEvent(event);
     }
@@ -2236,6 +2332,8 @@ class GameLifecyclePlugin {
         }
     }
     _trackH5PageLoad() {
+        if (this._isOptedOut())
+            return;
         const g = globalThis;
         const loadStart = g.performance?.timing?.navigationStart;
         const loadEnd = g.performance?.timing?.loadEventEnd;
@@ -2247,6 +2345,8 @@ class GameLifecyclePlugin {
         this._enqueueEvent(event);
     }
     _handleH5PageLeave() {
+        if (this._isOptedOut())
+            return;
         const duration = this._pageShowTimestamp > 0
             ? Math.min(Math.floor((Date.now() - this._pageShowTimestamp) / 1000), 432000)
             : 0;
@@ -2262,6 +2362,8 @@ class GameLifecyclePlugin {
             if (!sdk || typeof sdk.onShareAppMessage !== 'function')
                 return;
             this._onShareHandler = (res) => {
+                if (this._isOptedOut())
+                    return;
                 const from = res && typeof res.from === 'string' ? res.from : 'unknown';
                 const event = this._send.sendEvent('$MPShare', {
                     $share_from: from,
@@ -2311,10 +2413,12 @@ class UTMPlugin {
         this._currentUtm = {};
         this._destroyed = false;
         this._userSetTimer = null;
+        this._initialUtmSent = false;
         this._store = opts.store;
         this._send = opts.send;
         this._platformAdapter = opts.platformAdapter;
         this._enqueueEvent = opts.enqueueEvent;
+        this._isOptedOut = opts.isOptedOut ?? (() => false);
         this._extractUTM();
         this._send.setUtmProvider(() => this.getSessionUTM());
     }
@@ -2441,6 +2545,13 @@ class UTMPlugin {
         }
     }
     _reportInitialUTM() {
+        if (this._isOptedOut()) {
+            return;
+        }
+        this._scheduleInitialUtmUserSet();
+    }
+    _scheduleInitialUtmUserSet() {
+        this._initialUtmSent = true;
         const userProperties = {
             $set_once: {},
         };
@@ -2452,6 +2563,9 @@ class UTMPlugin {
         if (event.user_properties) {
             delete event.user_properties.$set;
         }
+        if (this._userSetTimer) {
+            clearTimeout(this._userSetTimer);
+        }
         this._userSetTimer = setTimeout(() => {
             this._userSetTimer = null;
             if (this._destroyed)
@@ -2462,6 +2576,11 @@ class UTMPlugin {
             catch (e) {
             }
         }, 0);
+    }
+    onOptIn() {
+        if (this._initialUtmSent)
+            return;
+        this._scheduleInitialUtmUserSet();
     }
     getSessionUTM() {
         const result = {};
@@ -2527,6 +2646,7 @@ class ABTestPlugin {
         this._refreshInterval = Math.max(opts.refreshInterval, CONSTANTS.MIN_AB_REFRESH_INTERVAL);
         this._requestFn = opts.requestFn;
         this._enqueueEvent = opts.enqueueEvent;
+        this._isOptedOut = opts.isOptedOut;
     }
     init() {
         if (!this._enableAB)
@@ -2542,6 +2662,8 @@ class ABTestPlugin {
         }, this._refreshInterval);
     }
     fastFetch() {
+        if (this._isOptedOut())
+            return Promise.resolve([]);
         const cached = this._store.getABData();
         if (cached.length > 0) {
             return Promise.resolve(cached);
@@ -2693,6 +2815,8 @@ class Sensorswave {
         this._emitter = new EventEmitter();
         this._sourceToken = '';
         this._apiHost = '';
+        this._optOutCapturing = false;
+        this._persistOptOut = false;
         this._requestFn = this._defaultRequestFn.bind(this);
     }
     init(sourceToken, config) {
@@ -2710,6 +2834,19 @@ class Sensorswave {
         const ccSys = this._getCCSys();
         const safeStorage = new SafeStorage(ccSys.localStorage);
         this._store = new Store(safeStorage);
+        this._persistOptOut = !!mergedConfig.persistOptOut;
+        if (this._optOutCapturing) {
+            if (this._persistOptOut)
+                this._store.setOptOut(true);
+        }
+        else if (mergedConfig.optOutCapturing) {
+            this._optOutCapturing = true;
+            if (this._persistOptOut)
+                this._store.setOptOut(true);
+        }
+        else if (this._persistOptOut && this._store.isOptedOut()) {
+            this._optOutCapturing = true;
+        }
         this._queue = new PersistentQueue(safeStorage);
         this._batchSender = new BatchSender(this._queue, this._requestFn, mergedConfig.maxBatchSize, mergedConfig.flushInterval);
         const platformType = detectPlatform(ccSys);
@@ -2737,6 +2874,7 @@ class Sensorswave {
             refreshInterval: mergedConfig.abRefreshInterval,
             requestFn: this._requestFn,
             enableShareTrack: mergedConfig.enableShareTrack,
+            isOptedOut: () => this._optOutCapturing,
             enqueueEvent: (event) => this._enqueuePluginEvent(event),
             flushImmediate: () => {
                 if (this._batchSender)
@@ -2748,12 +2886,17 @@ class Sensorswave {
         if (this._batchSendEnabled) {
             this._batchSender.start();
         }
+        if (this._optOutCapturing) {
+            this._batchSender.pause();
+        }
         this.inited = true;
         this._emitter.emit('INIT_READY');
         logger.info('init success', { sourceToken, platform: platformType });
     }
     trackEvent(eventName, properties) {
         if (!this._ensureInited())
+            return;
+        if (this._optOutCapturing)
             return;
         if (!Send.isValidEventName(eventName)) {
             logger.warn('trackEvent() requires a non-empty event name');
@@ -2769,6 +2912,8 @@ class Sensorswave {
         }
         if (!this._ensureInited())
             return;
+        if (this._optOutCapturing)
+            return;
         if (!Send.isValidEventName(eventData.event)) {
             logger.warn('track() requires a non-empty event name');
             return;
@@ -2778,6 +2923,8 @@ class Sensorswave {
     }
     identify(loginId) {
         if (!this._ensureInited())
+            return;
+        if (this._optOutCapturing)
             return;
         if (!loginId)
             return;
@@ -2793,15 +2940,17 @@ class Sensorswave {
     setLoginId(loginId) {
         if (!this._ensureInited())
             return;
+        if (this._optOutCapturing)
+            return;
         this._store.setLoginId(String(loginId));
     }
     getAnonId() {
-        if (!this._store)
+        if (!this._store || this._optOutCapturing)
             return '';
         return this._store.getAnonId();
     }
     getLoginId() {
-        if (!this._store)
+        if (!this._store || this._optOutCapturing)
             return '';
         return this._store.getLoginId();
     }
@@ -2849,6 +2998,8 @@ class Sensorswave {
     profileDelete() {
         if (!this._ensureInited())
             return;
+        if (this._optOutCapturing)
+            return;
         const loginId = this._store.getLoginId();
         if (!loginId && !this._store.getAnonId()) {
             logger.warn('profileDelete requires login_id or anon_id');
@@ -2859,7 +3010,7 @@ class Sensorswave {
         this._enqueueEvent(event);
     }
     checkFeatureGate(key) {
-        if (!this.inited || !this._pluginManager)
+        if (!this.inited || !this._pluginManager || this._optOutCapturing)
             return Promise.resolve(false);
         const abPlugin = this._pluginManager.getPlugin('ABTest');
         if (!abPlugin)
@@ -2867,7 +3018,7 @@ class Sensorswave {
         return abPlugin.checkFeatureGate(key);
     }
     getFeatureConfig(key) {
-        if (!this.inited || !this._pluginManager)
+        if (!this.inited || !this._pluginManager || this._optOutCapturing)
             return Promise.resolve({});
         const abPlugin = this._pluginManager.getPlugin('ABTest');
         if (!abPlugin)
@@ -2875,7 +3026,7 @@ class Sensorswave {
         return abPlugin.getFeatureConfig(key);
     }
     getExperiment(key) {
-        if (!this.inited || !this._pluginManager)
+        if (!this.inited || !this._pluginManager || this._optOutCapturing)
             return Promise.resolve(null);
         const abPlugin = this._pluginManager.getPlugin('ABTest');
         if (!abPlugin)
@@ -2883,7 +3034,7 @@ class Sensorswave {
         return abPlugin.getExperiment(key);
     }
     flush() {
-        if (!this._batchSender)
+        if (!this._batchSender || this._optOutCapturing)
             return;
         this._batchSender.flush();
     }
@@ -2895,6 +3046,36 @@ class Sensorswave {
             return;
         utmPlugin.setDeepLinkQuery(query);
     }
+    optOutCapturing() {
+        this._optOutCapturing = true;
+        if (this.inited) {
+            if (this._persistOptOut && this._store)
+                this._store.setOptOut(true);
+            if (this._batchSender)
+                this._batchSender.pause();
+        }
+    }
+    optInCapturing() {
+        this._optOutCapturing = false;
+        if (this.inited) {
+            if (this._persistOptOut && this._store)
+                this._store.setOptOut(false);
+            if (this._batchSender)
+                this._batchSender.resume();
+            const utmPlugin = this._pluginManager?.getPlugin('UTM');
+            if (utmPlugin) {
+                try {
+                    utmPlugin.onOptIn();
+                }
+                catch (e) {
+                    logger.warn('Failed to replay initial UTM on opt-in:', e);
+                }
+            }
+        }
+    }
+    hasOptedOutCapturing() {
+        return this._optOutCapturing;
+    }
     destroy() {
         if (this._pluginManager) {
             this._pluginManager.destroy();
@@ -2904,6 +3085,8 @@ class Sensorswave {
         }
         this._emitter.removeAllListeners();
         this.inited = false;
+        this._optOutCapturing = false;
+        this._persistOptOut = false;
         this._store = null;
         this._queue = null;
         this._batchSender = null;
@@ -2914,6 +3097,8 @@ class Sensorswave {
     }
     _profileOp(operator, props) {
         if (!this._ensureInited())
+            return;
+        if (this._optOutCapturing)
             return;
         const anonId = this._store.getAnonId();
         const loginId = this._store.getLoginId();
@@ -2929,6 +3114,8 @@ class Sensorswave {
         this._enqueueEvent(event);
     }
     _enqueueEvent(event) {
+        if (this._optOutCapturing)
+            return;
         this._queue.enqueue([event], `${this._apiHost}${CONSTANTS.TRACK_ENDPOINT}`, {
             'Content-Type': 'application/json',
             SourceToken: this._sourceToken,

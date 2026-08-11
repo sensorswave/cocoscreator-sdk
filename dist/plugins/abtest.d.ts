@@ -19,6 +19,7 @@ export interface ABTestOpts {
     refreshInterval: number;
     requestFn: (config: RequestConfig) => void;
     enqueueEvent: (event: SensorswaveSendEvent) => void;
+    isOptedOut: () => boolean;
 }
 export declare class ABTestPlugin implements IPlugin {
     static NAME: string;
@@ -34,6 +35,7 @@ export declare class ABTestPlugin implements IPlugin {
     private _refreshTimer;
     private _enqueueEvent;
     private _lastFetchTime;
+    private _isOptedOut;
     constructor(opts: ABTestOpts);
     init(): void;
     private _startRefreshTimer;

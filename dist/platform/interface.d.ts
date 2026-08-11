@@ -17,6 +17,14 @@ type MiniGameSDK = {
     }) => void) => void;
     offShareAppMessage?: (cb?: (res: any) => void) => void;
     getSystemInfoSync?: () => Record<string, any>;
+    getAccountInfoSync?: () => {
+        miniProgram?: {
+            appId?: string;
+            envVersion?: string;
+            version?: string;
+        };
+        plugin?: Record<string, any>;
+    } | null;
     getNetworkType?: (opts: {
         success?: (res: {
             networkType: string;

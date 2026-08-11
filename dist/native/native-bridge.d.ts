@@ -8,6 +8,7 @@ export interface NativeDeviceInfo {
     model?: string;
     osVersion?: string;
     region?: string;
+    installTime?: number;
 }
 export type GetDeviceInfoFn = (() => NativeDeviceInfo | Promise<NativeDeviceInfo>) | null | undefined;
 export declare class NativeBridge {

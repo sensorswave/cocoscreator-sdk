@@ -233,7 +233,7 @@ Sensorswave.trackEvent('Login', { method: 'wechat' });
 
 #### 需要尽早 init 时（可选）
 
-新建 `assets/scripts/SdkManager.js`（也**勾选"导入为插件"**），实现"selfInit + 100ms 轮询 fallback"模式。bundle 加载后自动调 `Sensorswave.init()`，业务代码进 page 时 `SdkManager.ensureSDKInitialized()` 兜底。
+新建 `assets/scripts/SdkManager.js`（也**勾选"导入为插件"**），实现"selfInit + 100ms 轮询 fallback"模式。bundle 加载后自动调 `Sensorswave.init()`。
 
 ### 2.3 iOS 集成
 
@@ -335,6 +335,8 @@ rm -rf build
 | `enableAB`          | boolean                                               | `false`  | 是否启用 A/B 测试功能                                                                                                          |
 | `abRefreshInterval` | number                                                | `600000` | A/B 测试配置刷新间隔（毫秒，默认 10 分钟，最小 30 秒）                                                                                      |
 | `enableShareTrack`  | boolean                                               | `true`   | 是否自动采集小游戏分享事件（仅小游戏端生效）                                                                                                 |
+| `optOutCapturing`   | boolean                                               | `false`  | 【合规】初始化即禁用采集。SDK 启动后处于静默状态：不写本地标识符、不发任何事件与请求，等用户授权后调用 `optInCapturing()` 开启                |
+| `persistOptOut`     | boolean                                               | `false`  | 【合规】是否将 opt-out 状态持久化到本地存储。`true` 时状态跨会话保留（重启后恢复）；`false` 时仅存内存，重启后回到采集开启                |
 
 ### 3.2 事件追踪
 
@@ -489,6 +491,58 @@ if (Object.keys(experiment).length > 0) {
   applyTheme(theme_color, layout);
 }
 ```
+
+### 3.7 合规采集开关（opt-out）
+
+满足隐私合规场景（如 GDPR / 用户授权采集）：在拿到用户授权前禁用采集，授权后再开启。
+
+> 默认行为（`optOutCapturing` 不设或为 `false`）：SDK 一启动即采集，无需调用本节 API。
+
+#### 初始化即禁用（推荐）
+
+```typescript
+Sensorswave.init('your-source-token', {
+  apiHost: 'https://your-api-host.com',
+  optOutCapturing: true, // 启动即静默，等用户授权
+});
+
+// 用户同意《隐私政策》后，业务方主动开启采集
+Sensorswave.optInCapturing();
+```
+
+#### 状态持久化（跨会话保留）
+
+默认情况下 opt-out 状态仅存内存，App 重启后回到「采集开启」。若希望用户的选择跨会话保留，设置 `persistOptOut: true`：
+
+```typescript
+Sensorswave.init('your-source-token', {
+  apiHost: 'https://your-api-host.com',
+  optOutCapturing: true, // 首次启动默认禁用
+  persistOptOut: true,   // 用户授权后，opt-in 状态持久化；重启后保持已授权
+});
+```
+
+> 开启 `persistOptOut` 后，`optOutCapturing()` / `optInCapturing()` 会将状态写入本地存储（`sw_opt_out`），下次 `init` 自动恢复，**业务方无需自行维护用户授权状态**。
+
+#### API
+
+| 方法                      | 返回       | 说明                                                            |
+| ----------------------- | -------- | ------------------------------------------------------------- |
+| `optOutCapturing()`     | `void`   | 禁用采集。调用后 SDK 静默：不读隐私、不写本地、不发任何事件/请求。可在 `init()` 前调用（仅置内存标记）。 |
+| `optInCapturing()`      | `void`   | 允许采集。恢复上报；若初始化时处于 opt-out 且初始 UTM 的 `$UserSet` 尚未发送，则补发一次（多次调用只补发一次）。 |
+| `hasOptedOutCapturing()` | `boolean` | 返回当前是否处于禁用采集状态。                                              |
+
+```typescript
+// 主动禁用（例如用户撤回授权）
+Sensorswave.optOutCapturing();
+Sensorswave.hasOptedOutCapturing(); // true
+
+// 恢复采集
+Sensorswave.optInCapturing();
+Sensorswave.hasOptedOutCapturing(); // false
+```
+
+***
 
 ## 4. 自动采集事件
 

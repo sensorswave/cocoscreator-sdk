@@ -8,6 +8,7 @@ export interface UTMOpts {
     presetProps: PresetProperties;
     platformAdapter: any;
     enqueueEvent: (event: SensorswaveSendEvent) => void;
+    isOptedOut?: () => boolean;
 }
 export declare class UTMPlugin implements IPlugin {
     static NAME: string;
@@ -19,6 +20,8 @@ export declare class UTMPlugin implements IPlugin {
     private _enqueueEvent;
     private _destroyed;
     private _userSetTimer;
+    private _isOptedOut;
+    private _initialUtmSent;
     constructor(opts: UTMOpts);
     init(): void;
     setDeepLinkQuery(query: Record<string, any> | string | null | undefined): void;
@@ -26,6 +29,8 @@ export declare class UTMPlugin implements IPlugin {
     private _parseUTMFromQuery;
     private _parseUTMFromURL;
     private _reportInitialUTM;
+    private _scheduleInitialUtmUserSet;
+    onOptIn(): void;
     getSessionUTM(): Record<string, string>;
     destroy(): void;
 }

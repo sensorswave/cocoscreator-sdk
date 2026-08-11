@@ -13,6 +13,8 @@ declare class Sensorswave {
     private _sourceToken;
     private _apiHost;
     private _requestFn;
+    private _optOutCapturing;
+    private _persistOptOut;
     constructor();
     init(sourceToken: string, config: SensorswaveConfig): void;
     trackEvent(eventName: string, properties?: Record<string, any>): void;
@@ -41,6 +43,9 @@ declare class Sensorswave {
     getExperiment(key: string): Promise<Record<string, any> | null>;
     flush(): void;
     setDeepLinkQuery(query: Record<string, any> | string | null | undefined): void;
+    optOutCapturing(): void;
+    optInCapturing(): void;
+    hasOptedOutCapturing(): boolean;
     destroy(): void;
     private _profileOp;
     private _enqueuePluginEvent;

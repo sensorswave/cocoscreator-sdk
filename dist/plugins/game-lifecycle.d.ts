@@ -13,6 +13,7 @@ export interface GameLifecycleOpts {
     enqueueEvent: (event: SensorswaveSendEvent) => void;
     flushImmediate: () => void;
     enableShareTrack?: boolean;
+    isOptedOut?: () => boolean;
 }
 export declare class GameLifecyclePlugin implements IPlugin {
     static NAME: string;
@@ -32,6 +33,7 @@ export declare class GameLifecyclePlugin implements IPlugin {
     private _flushImmediate;
     private _destroyed;
     private _initTimer;
+    private _isOptedOut;
     constructor(opts: GameLifecycleOpts);
     init(): void;
     private _initAppLifecycle;

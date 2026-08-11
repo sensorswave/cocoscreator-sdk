@@ -8,8 +8,12 @@ export declare class BatchSender {
     private _isFlushing;
     private _requestFn;
     private _destroyed;
+    private _paused;
+    private _started;
     constructor(queue: PersistentQueue, requestFn: (config: RequestConfig) => void, maxBatchSize?: number, flushInterval?: number);
     start(): void;
+    pause(): void;
+    resume(): void;
     add(): void;
     triggerFlush(): void;
     flush(): void;

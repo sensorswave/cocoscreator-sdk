@@ -10,6 +10,8 @@ export declare const CONSTANTS: {
     LOGIN_ID_KEY: string;
     AB_DATA_KEY: string;
     LAUNCHED_KEY: string;
+    OPT_OUT_KEY: string;
+    INSTALL_TIME_KEY: string;
     AB_CACHE_TTL: number;
     MIN_AB_REFRESH_INTERVAL: number;
     PRESET_PROPS_CACHE_DURATION: number;

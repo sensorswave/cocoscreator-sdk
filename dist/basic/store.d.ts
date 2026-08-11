@@ -15,4 +15,8 @@ export declare class Store {
     saveABData(results: ABData[]): void;
     setLaunched(): void;
     isLaunched(): boolean;
+    getInstallTime(): number | null;
+    setInstallTime(ts: number): void;
+    setOptOut(optedOut: boolean): void;
+    isOptedOut(): boolean;
 }

@@ -10,6 +10,8 @@ export interface SensorswaveConfig {
     enableAB?: boolean;
     abRefreshInterval?: number;
     enableShareTrack?: boolean;
+    optOutCapturing?: boolean;
+    persistOptOut?: boolean;
     getSceneName?: () => string;
     getDeviceInfo?: () => NativeDeviceInfo | Promise<NativeDeviceInfo>;
 }
@@ -118,6 +120,7 @@ export interface IPlatformAdapter {
     getPresetProperties(): Record<string, any>;
     getDynamicProperties(): Record<string, any>;
     getLaunchOptions(): Record<string, any>;
+    getInstallTime?(): number | null;
 }
 export interface IPlugin {
     NAME: string;
