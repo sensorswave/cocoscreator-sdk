@@ -24,8 +24,10 @@ declare class Sensorswave {
         user_properties?: UserProperties;
         subject_properties?: Record<string, any>;
     }): void;
+    trackException(throwable: unknown, properties?: Record<string, any>): void;
     identify(loginId: string): void;
     setLoginId(loginId: string): void;
+    reset(resetAnonId?: boolean): void;
     getAnonId(): string;
     getLoginId(): string;
     getPlugins(): Map<string, unknown>;
@@ -57,4 +59,4 @@ declare class Sensorswave {
 declare const sensorswave: Sensorswave;
 export default sensorswave;
 export { Sensorswave };
-export type { SensorswaveConfig } from './types';
+export type { SensorswaveConfig, ExceptionLevel, ExceptionPlatform, ExceptionFrame } from './types';

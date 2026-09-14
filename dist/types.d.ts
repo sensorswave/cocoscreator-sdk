@@ -10,6 +10,8 @@ export interface SensorswaveConfig {
     enableAB?: boolean;
     abRefreshInterval?: number;
     enableShareTrack?: boolean;
+    enableCrashTrack?: boolean;
+    enableErrorTrack?: boolean;
     optOutCapturing?: boolean;
     persistOptOut?: boolean;
     getSceneName?: () => string;
@@ -115,6 +117,37 @@ export interface ABResponse {
     };
 }
 export type PlatformType = 'app' | 'minigame' | 'h5';
+export type ExceptionLevel = 'fatal' | 'error';
+export interface NormalizedException {
+    type: string;
+    message: string;
+    stack: string;
+}
+export type ExceptionPlatform = 'web:javascript' | 'java' | 'dart' | 'hermes' | 'cocoa' | 'native';
+export interface ExceptionFrame {
+    platform: ExceptionPlatform;
+    filename?: string;
+    function?: string;
+    lineno?: number;
+    colno?: number;
+    abs_path?: string;
+    module?: string;
+    instruction_addr?: string;
+    image_addr?: string;
+    debug_id?: string;
+}
+export interface NativeCrashImage {
+    name: string;
+    base: string;
+    debug_id?: string;
+}
+export interface NativeCrashRecord {
+    type: string;
+    message: string;
+    stack: string;
+    timestamp: number;
+    images?: NativeCrashImage[];
+}
 export interface IPlatformAdapter {
     getPlatformType(): PlatformType;
     getPresetProperties(): Record<string, any>;

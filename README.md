@@ -160,13 +160,13 @@ cp node_modules/@sensorswave/cocoscreator-sdk/native/harmonyos/SensorsWaveBridge
 
 #### 步骤 2：在 `cocos_worker.ets` 注册导入 + 调用入口
 
-打开 `native/engine/harmonyos-next/entry/src/main/ets/workers/cocos_worker.ets`，做两处修改：
+打开 `native/engine/harmonyos-next/entry/src/main/ets/workers/cocos_worker.ets`，做三处修改：
 
 **修改 1**：在 `import '../cocos/oh-adapter/sys-ability-polyfill';` 后面加 import：
 
 ```typescript
 import '../cocos/oh-adapter/sys-ability-polyfill';
-import { injectSensorsWaveAppInfo } from '../cocos/SensorsWaveBridge';
+import { injectSensorsWaveAppInfo, setSensorsWaveFilesDir } from '../cocos/SensorsWaveBridge';
 ```
 
 **修改 2**：在 `uiPort.on("onXCLoad", () => { ... })` 回调内、**`renderContext.nativeEngineInit()`** **之后**调用：
@@ -182,11 +182,64 @@ uiPort.on("onXCLoad", () => {
 });
 ```
 
-#### 步骤 3：直接 DevEco Studio 编译 HAP
+**修改 3**（`enableCrashTrack` 需要）：在 `uiPort.on("onXCLoad", ...)` **之前**注册沙箱路径监听：
+
+```typescript
+// [SensorsWave] 主线程转发的沙箱路径。classic worker 里 getContext() 会抛错
+// （preferences 不可用），崩溃记录 / deviceId 落盘（@ohos.file.fs）只能用
+// 主线程经 UiPort 转发进来的 filesDir
+uiPort.on("swFilesDir", (dir: string): void => {
+  setSensorsWaveFilesDir(dir);
+});
+```
+
+对应地，在 `entry/src/main/ets/pages/index.ets` 的 XComponent `.onLoad((context) => { ... })` 里、`this.workPort.postMessage("onXCLoad");` 之后加一行：
+
+```typescript
+.onLoad((context) => {
+  this.workPort.postMessage("onXCLoad");
+  // [SensorsWave] 转发沙箱 filesDir 给 worker（崩溃记录 / deviceId 落盘用）
+  this.workPort.postMessage("swFilesDir", getContext(this).filesDir);
+})
+```
+
+> ⚠️ 不做修改 3 时 `enableCrashTrack` **静默失效**（崩溃记录无法落盘，启动日志有 filesDir warn），其余功能不受影响。
+
+#### 步骤 3（`enableErrorTrack` 需要）：集成 C++ 异常 hook
+
+Cocos 3.8.x 的 OHOS 构建使用 **jsvm** JSB 后端，**没有** iOS / Android 走的引擎 `__errorHandler` 通道。不集成本步骤时，鸿蒙上 JS 未捕获异常**不会**产生 `$Exception`（error 级）事件——SDK 特性探测不到只会记录日志跳过（静默降级，不影响其他功能）。
+
+复制 hook 源文件到 OHOS 工程根目录：
+
+```bash
+cp node_modules/@sensorswave/cocoscreator-sdk/native/harmonyos/SensorsWaveExceptionHook.cpp \
+   native/engine/harmonyos-next/
+```
+
+编辑 `native/engine/harmonyos-next/CMakeLists.txt`，加两行：
+
+```cmake
+set(CC_LIB_NAME cocos)
+set(CC_PROJ_SOURCES)
+# [SensorsWave] jsvm 异常 hook（原理见该 cpp 头部注释）
+list(APPEND CC_PROJ_SOURCES ${CMAKE_CURRENT_SOURCE_DIR}/SensorsWaveExceptionHook.cpp)
+```
+
+```cmake
+add_library(${CC_LIB_NAME} SHARED ${CC_ALL_SOURCES})
+# [SensorsWave] 链接期接管 jsb_register_all_modules（jsvm 异常通道）
+target_link_options(${CC_LIB_NAME} PRIVATE "-Wl,--wrap=_Z24jsb_register_all_modulesv")
+```
+
+> 原理：`--wrap` 在链接 `libcocos.so` 时接管引擎对 `jsb_register_all_modules()` 的调用，把 `jsb.swInstallExceptionHook` 注册进游戏 JS 引擎，SDK 据此接管 jsvm 的异常回调槽位。`-Wl,--wrap=` 后面是 Itanium C++ 修饰名（`c++filt _Z24jsb_register_all_modulesv` 可验证）；若引擎升级改名导致 wrap 失效，链接不报错、jsb 函数不出现，SDK 侧优雅降级，不会崩溃。
+
+#### 步骤 4：直接 DevEco Studio 编译 HAP
 
 #### 验证
 
 启动 App 后，业务方触发一个事件，上报数据里 `$app_id` / `$app_version` / `$region` / `$model` / `$brand` / `$manufacturer` / `$network_type` / `$wifi` 不再为空。
+
+`$Exception` 通道验证：`hilog` 应能看到 `crash watcher installed`、`filesDir ready (crash store enabled)`、`[Exception] OHOS jsvm exception hook installed` 三条日志（对应步骤 2 / 步骤 3 的集成结果）。
 
 ***
 
@@ -335,6 +388,8 @@ rm -rf build
 | `enableAB`          | boolean                                               | `false`  | 是否启用 A/B 测试功能                                                                                                          |
 | `abRefreshInterval` | number                                                | `600000` | A/B 测试配置刷新间隔（毫秒，默认 10 分钟，最小 30 秒）                                                                                      |
 | `enableShareTrack`  | boolean                                               | `true`   | 是否自动采集小游戏分享事件（仅小游戏端生效）                                                                                                 |
+| `enableCrashTrack`  | boolean                                               | `false`  | 是否采集 App 原生崩溃（`$Exception` 事件，`$exception_level = 'fatal'`，下次启动补报）。仅 App 端（iOS / Android / HarmonyOS）生效，且需集成原生桥文件（HarmonyOS 另需 filesDir 转发，见 1.5 步骤 2 修改 3；其余见 4.4） |
+| `enableErrorTrack`  | boolean                                               | `false`  | 是否自动采集 JS 未捕获异常与 Promise rejection（`$Exception` 事件，`$exception_level = 'error'`）。App / 小游戏 / H5 全端生效（HarmonyOS 需集成 C++ hook 且不采集 Promise rejection，见 1.5 步骤 3）                    |
 | `optOutCapturing`   | boolean                                               | `false`  | 【合规】初始化即禁用采集。SDK 启动后处于静默状态：不写本地标识符、不发任何事件与请求，等用户授权后调用 `optInCapturing()` 开启                |
 | `persistOptOut`     | boolean                                               | `false`  | 【合规】是否将 opt-out 状态持久化到本地存储。`true` 时状态跨会话保留（重启后恢复）；`false` 时仅存内存，重启后回到采集开启                |
 
@@ -382,12 +437,31 @@ Sensorswave.track({
 - `user_properties`（object，可选）：用户属性操作，支持 `$set` / `$set_once` / `$increment` / `$append` / `$union` / `$unset` / `$delete`
 - `subject_properties`（Record\<string, any>，可选）：主体属性
 
+#### `trackException(throwable, properties?)`
+
+手动上报一个已捕获的异常（`$Exception` 事件，`$exception_level` 固定为 `error`）。
+适用于业务方在 `try/catch` 中上报不影响主流程的异常。**不受** `enableErrorTrack` / `enableCrashTrack` 开关限制；opt-out 期间不上报；永不抛异常。
+
+```typescript
+try {
+  riskyOperation();
+} catch (e) {
+  Sensorswave.trackException(e, { scene: 'battle' });
+}
+```
+
+| 参数           | 类型                    | 必填 | 说明                                                                                                                    |
+| ------------ | --------------------- | -- | --------------------------------------------------------------------------------------------------------------------- |
+| `throwable`  | unknown               | ✓  | `Error` 对象、`"Uncaught TypeError: xxx"` 形态字符串或任意值（防御式规范化，不会抛异常）                                         |
+| `properties` | `Record<string, any>` | ✗  | 附加属性（5 个 `$exception_*` 专属属性优先级更高，同名用户 key 会被覆盖）                                                       |
+
 ### 3.3 用户标识
 
 | 方法                    | 说明                                                            |
 | --------------------- | ------------------------------------------------------------- |
 | `identify(loginId)`   | 设置用户登录 ID，并发送 `$Identify` 事件关联匿名行为与登录用户。**登录 ID 未变化则不会重复发送**。 |
 | `setLoginId(loginId)` | 设置用户登录 ID，**不发送**关联事件。适用于恢复登录状态等场景。                           |
+| `reset(resetAnonId?)` | 用户登出时调用，解除登录 ID 与设备的绑定。默认保留匿名 ID；传 `true` 同时重置匿名 ID。同时清除 AB 实验缓存。**不发送**任何事件。 |
 | `getLoginId()`        | 获取当前登录 ID，返回 `string`。                                        |
 | `getAnonId()`         | 获取当前匿名 ID（SDK 初始化时自动生成并持久化），返回 `string`。                      |
 
@@ -397,7 +471,18 @@ Sensorswave.identify('user_12345');
 
 // 恢复登录状态（不发送事件）
 Sensorswave.setLoginId('user_12345');
+
+// 用户登出时
+Sensorswave.reset();  // 默认保留匿名 ID
+
+// 如果需要同时重置匿名 ID（如公共设备场景）
+Sensorswave.reset(true);
 ```
+
+> 说明：
+> - `reset()` 仅清除登录 ID；`reset(true)` 会生成**新的匿名 ID**（下次 `getAnonId()` 时惰性生成），此前的匿名 ID 不再使用。
+> - 两种形式均会清除 AB 实验缓存（实验分组与用户身份绑定，登出后不沿用登录用户的分组结果）。
+> - init 前调用为空操作；opt-out（禁用采集）期间为空操作。
 
 ### 3.4 用户属性
 
@@ -572,6 +657,43 @@ Sensorswave.hasOptedOutCapturing(); // false
 | `$PageView`  | 页面初始化  | —                                     |
 | `$PageLoad`  | 页面加载完成 | `$page_load_time`（加载耗时，毫秒）            |
 | `$PageLeave` | 用户离开页面 | `$event_duration`（页面停留时长，秒，上限 432000） |
+
+### 4.4 异常捕获（全端）
+
+上报 `$Exception` 事件
+
+| 属性                  | 说明                                                                                     |
+| ------------------- | -------------------------------------------------------------------------------------- |
+| `$exception_level`  | `fatal`（未捕获异常导致进程终止 / App crash，均为下次启动补报）/ `error`（其他）                          |
+| `$exception_type`   | 异常类全名（JS：`TypeError` / `ReferenceError` 等；原生：`java.lang.NullPointerException` / `NSException` 等；iOS 信号兜底为信号名 `SIGSEGV` / `SIGABRT` 等） |
+| `$exception_message` | 仅 message，不含堆栈                                                                        |
+| `$exception_frames` | 结构化帧数组（最多 30 帧，最外层在前）；帧含 `platform`（`web:javascript` / `java` / `cocoa` / `native` 多端路由；iOS 原生帧归 `cocoa`，服务端据此选 dSYM 符号化器）、`filename`（清洗后路径）、`function`（匿名为 `"?"`）、`lineno`/`colno`（数字；Java/iOS 无 colno）、`abs_path`（仅 web，清洗前原始 URL）、`module`（Java 全限定类名 / iOS 镜像名 / native so 基名）、`instruction_addr`（仅 cocoa/native 帧，运行时指令地址，16 位补零小写 hex，服务端符号化 key）、`image_addr`（仅 iOS，镜像运行时基址，服务端 dSYM 符号化入参）、`debug_id`（仅 iOS 主二进制帧，LC_UUID）字段，详见预置属性定义 |
+
+**平台矩阵与开关**（两开关均独立于 `autoCapture`，默认关闭）：
+
+| 端           | `enableErrorTrack`（error 级自动采集）                    | `enableCrashTrack`（fatal 级崩溃补报）                    |
+| ----------- | -------------------------------------------------- | -------------------------------------------------- |
+| App（iOS / Android） | ✓ JS 未捕获异常（引擎 `__errorHandler`）+ Promise rejection | ✓ 原生未捕获异常 + iOS 信号级崩溃（下次启动补报）                          |
+| App（HarmonyOS） | ✓ JS 未捕获异常（jsvm 无 `__errorHandler`，**必须集成 C++ hook**，见 1.5 步骤 3）；✗ Promise rejection（平台限制，见限制 1） | ✓ 系统 `APP_CRASH` / `APP_FREEZE` 补报（**必须集成 filesDir 转发**，见 1.5 步骤 2 修改 3） |
+| 小游戏        | ✓ `onError` + `onUnhandledRejection`（按平台探测）        | —（忽略）                                             |
+| H5          | ✓ `window.onerror` + `unhandledrejection`             | —（忽略）                                             |
+
+**fatal 补报机制（App 端）**：
+
+1. 原生桥捕获崩溃并落盘（最多 10 条，30 天过期）：iOS `NSSetUncaughtExceptionHandler`（NSException）+ 信号兜底（`sigaction` 接管 `SIGABRT` / `SIGSEGV` / `SIGBUS` / `SIGILL` / `SIGFPE` / `SIGTRAP`，**落盘后链式重抛**——恢复崩溃前 handler 重投递原信号，进程按默认行为终止，系统崩溃报告照常生成，不影响第三方崩溃 SDK）/ Android `Thread.setDefaultUncaughtExceptionHandler`（**链式调用**原 handler，不影响第三方崩溃 SDK）；HarmonyOS 用 `hiAppEvent` watcher 订阅系统 `APP_CRASH` / `APP_FREEZE` 故障事件——**不拦截**未捕获异常，进程保持默认崩溃退出，系统 faultlogger 采集故障，下次启动 watcher 收到补报事件（含 native 崩溃与卡死，鸿蒙无需额外权限）
+2. 下次启动原生桥把落盘记录注入 JS（`globalThis.__sensorswave_pending_crashes__`），SDK init 时按 JS 侧**水位线**（`sw_last_crash_ts`）过滤补报——原生永不删除已注入记录，三端统一、零数据丢失。HarmonyOS 故障补报异步到达，SDK init 后还会安排少量重检兜底（水位线保证零重复）
+3. 手动上报用 `trackException(throwable, properties?)`（见 3.2），不受开关限制
+4. **符号化前提（集成方需配合归档发布产物）**：服务端按帧 `debug_id`（iOS，LC_UUID）/ `module` + `instruction_addr` 还原符号。iOS 每次构建产生的 dSYM（UUID 与构建一一对应）需在发布后归档并按平台要求提供；Android 混淆构建需保留 `mapping.txt`。未提供时帧保持地址形态（`instruction_addr` / `image_addr`），仍可按版本聚合
+
+**防洪水**：自动采集同 `type + message` 30 秒去重窗口；单会话（自动 + 手动合计）上限 20 条，超出丢弃；每次上报后立即 flush。
+
+**限制（如实声明）**：
+
+1. App 端 JS 未捕获异常（`__errorHandler` 触发时进程通常未终止）只报 error 级；JS 异常最终致进程终止且未经原生 handler 的 fatal 会丢失。HarmonyOS（jsvm 后端）没有 `__errorHandler`，error 级采集依赖 C++ hook（见 1.5 步骤 3）；**Promise rejection 在鸿蒙不采集**——jsvm 的微任务 rejection 不经过 JS↔native 调用边界，无钩子可挂（真机实证）
+2. Android 不覆盖信号级崩溃（SIGSEGV / SIGABRT）、ANR、JNI 内 native crash；iOS 信号兜底采集的帧**未符号化**——仅主二进制帧携带镜像名（SDK 按崩溃时刻镜像表回填 `image_addr` / `debug_id`），系统帧 `module` 为 `unknown`，需服务端 dSYM 符号化；HarmonyOS 的 native 崩溃（`CPP_CRASH`）与卡死（`APP_FREEZE`）由 hiAppEvent 覆盖
+3. 小游戏部分平台无 `offError` / `offUnhandledRejection`，destroy 无法完全卸载钩子
+4. **App 端 fatal 能力要求业务方更新到新版原生桥文件**；旧桥下静默降级（读不到注入，不报错）。HarmonyOS 旧桥（errorManager / preferences 方案）升级后行为变更：未捕获 ArkTS 异常不再被拦截（进程按系统默认行为崩溃退出；另经真机实证，classic worker 里的未捕获 ArkTS 异常本就不会杀死进程），且崩溃记录落盘改用 `@ohos.file.fs`——必须完成 1.5 步骤 2 修改 3 的 filesDir 转发，否则补报静默失效
+5. 补报事件 `time` 为补报时刻而非崩溃发生时刻（崩溃发生时刻随原生落盘记录的时间戳参与水位线去重，不作为事件属性上报）
 
 ***
 

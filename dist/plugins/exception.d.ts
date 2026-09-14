@@ -1,0 +1,56 @@
+import type { IPlugin, SensorswaveSendEvent } from '../types';
+import type { IPlatformAdapter } from '../platform/interface';
+import { Send } from '../basic/send';
+import { SafeStorage } from '../utils/safe-storage';
+export interface ExceptionOpts {
+    send: Send;
+    platformAdapter: IPlatformAdapter;
+    safeStorage: SafeStorage | null;
+    enableCrashTrack: boolean;
+    enableErrorTrack: boolean;
+    enqueueEvent: (event: SensorswaveSendEvent) => void;
+    flushImmediate: () => void;
+    isOptedOut?: () => boolean;
+}
+export declare class ExceptionPlugin implements IPlugin {
+    static NAME: string;
+    NAME: string;
+    private _send;
+    private _platformAdapter;
+    private _safeStorage;
+    private _enableCrashTrack;
+    private _enableErrorTrack;
+    private _enqueueEvent;
+    private _flushImmediate;
+    private _isOptedOut;
+    private _dedupMap;
+    private _sessionCount;
+    private _sessionCapWarned;
+    private _h5Window;
+    private _h5PrevOnError;
+    private _h5OnErrorWrapper;
+    private _h5RejectionHandler;
+    private _mpErrorHandler;
+    private _mpRejectionHandler;
+    private _appErrorHandler;
+    private _appPrevErrorHandler;
+    private _appHookInstalled;
+    private _ohosHookActive;
+    private _crashRecheckTimers;
+    constructor(opts: ExceptionOpts);
+    init(): void;
+    trackException(throwable: unknown, properties?: Record<string, any>): void;
+    destroy(): void;
+    private _reportPendingNativeCrashes;
+    private _scheduleCrashRechecks;
+    private _clearCrashRechecks;
+    private _reportAuto;
+    private _emit;
+    private _installH5Hooks;
+    private _destroyH5Hooks;
+    private _installMinigameHooks;
+    private _destroyMinigameHooks;
+    private _installAppHook;
+    private _ohosDispatchException;
+    private _destroyAppHook;
+}

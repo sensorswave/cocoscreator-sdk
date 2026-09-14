@@ -29,6 +29,8 @@ export declare class GameLifecyclePlugin implements IPlugin {
     private _onShowHandler;
     private _onHideHandler;
     private _onShareHandler;
+    private _showEventName;
+    private _hideEventName;
     private _enqueueEvent;
     private _flushImmediate;
     private _destroyed;

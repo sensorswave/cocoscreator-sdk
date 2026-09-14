@@ -27,9 +27,16 @@ import android.util.Log;
 import org.cocos2dx.lib.Cocos2dxHelper;
 import org.cocos2dx.lib.Cocos2dxJavascriptJavaBridge;
 
+import org.json.JSONArray;
 import org.json.JSONException;
 import org.json.JSONObject;
 
+import java.io.ByteArrayOutputStream;
+import java.io.File;
+import java.io.FileInputStream;
+import java.io.FileWriter;
+import java.io.PrintWriter;
+import java.io.StringWriter;
 import java.util.Locale;
 
 /**
@@ -48,10 +55,22 @@ public class SensorsWaveBridge extends ContentProvider {
     private static boolean sInjected = false;
     private static boolean sInjectedSuccess = false;
 
+    // ---- Crash Capture（$Exception fatal 补报数据源，与 iOS/HarmonyOS 三端统一约定）----
+
+    private static final String PENDING_CRASHES_KEY = "__sensorswave_pending_crashes__";
+    private static final String CRASH_FILE_NAME = "sensorswave_pending_crashes.json";
+    private static final int MAX_CRASH_RECORDS = 10;
+    private static final long CRASH_EXPIRY_MS = 30L * 24 * 3600 * 1000;
+    private static Thread.UncaughtExceptionHandler sPreviousCrashHandler;
+
     @Override
     public boolean onCreate() {
         sContext = getContext();
         Log.i(TAG, "ContentProvider onCreate, will inject device info when activity is ready");
+
+        // 崩溃捕获尽早安装（ContentProvider.onCreate 早于 Application/引擎启动），
+        // 这样引擎启动阶段的 Java 未捕获异常也能落盘
+        installCrashHandler();
 
         // 不能直接调 Cocos2dxHelper.runOnGLThread：ContentProvider.onCreate 早于
         // Cocos2dxActivity.onCreate，这时 Cocos2dxHelper.sActivity 还是 null。
@@ -136,6 +155,12 @@ public class SensorsWaveBridge extends ContentProvider {
             Log.e(TAG, "injectCurrentNetworkType threw", t);
         }
 
+        try {
+            injectPendingCrashes();
+        } catch (Throwable t) {
+            Log.e(TAG, "injectPendingCrashes threw", t);
+        }
+
         scheduleRetryInjection();
     }
 
@@ -165,6 +190,11 @@ public class SensorsWaveBridge extends ContentProvider {
                     injectCurrentNetworkType();
                 } catch (Throwable t) {
                     Log.w(TAG, "Retry injectCurrentNetworkType failed: " + t.getMessage());
+                }
+                try {
+                    injectPendingCrashes();
+                } catch (Throwable t) {
+                    Log.w(TAG, "Retry injectPendingCrashes failed: " + t.getMessage());
                 }
                 new Handler(Looper.getMainLooper()).postDelayed(new Runnable() {
                     @Override
@@ -349,6 +379,150 @@ public class SensorsWaveBridge extends ContentProvider {
         } catch (Throwable t) {
             Log.e(TAG, "evalJS threw exception: " + t.getMessage());
             return false;
+        }
+    }
+
+    // ---- Crash Capture 实现 ----
+
+    /**
+     * 安装默认未捕获异常处理器（保存原 handler 并链式调用，幂等）。
+     * ⚠️ handler 内只做文件写入，**绝不调 evalJS**——崩溃线程上调 evalString
+     * 需要 V8 AutoHandleScope（thread-local），会直接 SIGSEGV。
+     * 注入留给下次启动的 GL thread 回调。
+     */
+    private static void installCrashHandler() {
+        if (sPreviousCrashHandler != null) return; // 防重复安装
+        final Thread.UncaughtExceptionHandler previous = Thread.getDefaultUncaughtExceptionHandler();
+        sPreviousCrashHandler = previous;
+        Thread.setDefaultUncaughtExceptionHandler(new Thread.UncaughtExceptionHandler() {
+            @Override
+            public void uncaughtException(Thread thread, Throwable throwable) {
+                try {
+                    JSONObject record = new JSONObject();
+                    record.put("type", throwable.getClass().getName());
+                    record.put("message", String.valueOf(throwable.getMessage()));
+                    record.put("stack", stackToString(throwable));
+                    record.put("timestamp", System.currentTimeMillis());
+                    appendPendingCrashRecord(record);
+                } catch (Throwable t) {
+                    Log.e(TAG, "append crash record failed: " + t.getMessage());
+                }
+                // 链式调用原 handler（系统默认 handler 会终止进程）
+                if (previous != null) {
+                    previous.uncaughtException(thread, throwable);
+                }
+            }
+        });
+        Log.i(TAG, "crash handler installed");
+    }
+
+    /**
+     * 【调试用】抛未捕获 RuntimeException，验证 fatal 补报通道。
+     *
+     * demo「触发原生崩溃」按钮经 jsb.reflection.callStaticMethod(
+     * "com/sensorswave/cocoscreator/SensorsWaveBridge", "raiseTestException", "()V")
+     * 调用。
+     *
+     * ⚠️ 必须异步抛：CC 的 jsb 桥（JavaScriptJavaBridge）调用返回前会
+     * ExceptionDescribe + ExceptionClear 吞掉同步抛出的 Java 异常
+     * （JSJ_ERR_EXCEPTION_OCCURRED，进程不会崩）。投到主线程下一轮消息队列再抛，
+     * 脱离 JNI 调用栈 → 未捕获 → installCrashHandler 安装的 handler 落盘 →
+     * 链式调用系统 handler 终止进程 → 下次启动注入 JS 补报 $Exception(level=fatal)。
+     */
+    public static void raiseTestException() {
+        new Handler(Looper.getMainLooper()).post(new Runnable() {
+            @Override
+            public void run() {
+                throw new RuntimeException("SensorsWave fatal 通道验证崩溃");
+            }
+        });
+    }
+
+    private static String stackToString(Throwable t) {
+        try {
+            StringWriter sw = new StringWriter();
+            t.printStackTrace(new PrintWriter(sw));
+            return sw.toString();
+        } catch (Throwable x) {
+            return "";
+        }
+    }
+
+    /**
+     * 读取已落盘的崩溃记录（boot 裁剪：丢弃 >30 天的过期记录）。
+     * ⚠️ 水位线机制：原生**永不**因"已注入/已上报"删除记录（JS 侧用 localStorage
+     * 水位线过滤），裁剪只防文件无限增长（上限 10 条在 append 时保证）。
+     */
+    private static JSONArray readPendingCrashRecords() {
+        JSONArray records = new JSONArray();
+        try {
+            File f = new File(sContext.getFilesDir(), CRASH_FILE_NAME);
+            if (!f.exists()) return records;
+            FileInputStream in = new FileInputStream(f);
+            ByteArrayOutputStream bos = new ByteArrayOutputStream();
+            byte[] buf = new byte[4096];
+            int n;
+            while ((n = in.read(buf)) > 0) bos.write(buf, 0, n);
+            in.close();
+            String text = new String(bos.toByteArray(), "UTF-8");
+            if (text.trim().isEmpty()) return records;
+            JSONArray parsed = new JSONArray(text);
+            long cutoff = System.currentTimeMillis() - CRASH_EXPIRY_MS;
+            for (int i = 0; i < parsed.length(); i++) {
+                JSONObject item = parsed.optJSONObject(i);
+                if (item == null) continue;
+                if (item.optLong("timestamp", 0) < cutoff) continue;
+                records.put(item);
+            }
+            // 与 iOS 读路径对齐：读时也裁到上限（防文件异常膨胀），append 时同样保证
+            while (records.length() > MAX_CRASH_RECORDS) {
+                records.remove(0);
+            }
+        } catch (Throwable t) {
+            Log.w(TAG, "readPendingCrashRecords failed: " + t.getMessage());
+        }
+        return records;
+    }
+
+    /** 崩溃时追加一条记录（崩溃线程上同步写文件，synchronized 防并发写坏 JSON）。 */
+    private static synchronized void appendPendingCrashRecord(JSONObject record) {
+        try {
+            JSONArray records = readPendingCrashRecords();
+            records.put(record);
+            while (records.length() > MAX_CRASH_RECORDS) {
+                records.remove(0);
+            }
+            // finally 保证 FD 释放（写失败时不泄漏）；不用 try-with-resources 以兼容低 minSdk
+            FileWriter w = null;
+            try {
+                w = new FileWriter(new File(sContext.getFilesDir(), CRASH_FILE_NAME), false);
+                w.write(records.toString());
+            } finally {
+                if (w != null) {
+                    try {
+                        w.close();
+                    } catch (Throwable ignored) {
+                    }
+                }
+            }
+        } catch (Throwable t) {
+            Log.e(TAG, "persist crash records failed: " + t.getMessage());
+        }
+    }
+
+    /**
+     * boot 时把落盘的崩溃记录注入 JS global（JSON 数组文本直接当 JS array literal 嵌入，
+     * 不做 JSON.parse 双重包裹）。注入的记录保留在文件里——JS 侧水位线保证不重复上报。
+     */
+    private void injectPendingCrashes() {
+        try {
+            JSONArray records = readPendingCrashRecords();
+            if (records.length() == 0) return;
+            String script = "globalThis." + PENDING_CRASHES_KEY + " = " + records.toString() + ";";
+            boolean ok = evalJS(script);
+            Log.i(TAG, "Injected pending crashes (ok=" + ok + ", count=" + records.length() + ")");
+        } catch (Throwable t) {
+            Log.w(TAG, "injectPendingCrashes failed: " + t.getMessage());
         }
     }
 }

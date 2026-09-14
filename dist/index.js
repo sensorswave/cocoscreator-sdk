@@ -1,4 +1,4 @@
-const SDK_VERSION = '1.1.0';
+const SDK_VERSION = '1.2.0';
 
 const DEFAULT_CONFIG = {
     debug: false,
@@ -9,6 +9,8 @@ const DEFAULT_CONFIG = {
     enableAB: false,
     abRefreshInterval: 600000,
     enableShareTrack: true,
+    enableCrashTrack: false,
+    enableErrorTrack: false,
     optOutCapturing: false,
     persistOptOut: false,
 };
@@ -41,6 +43,20 @@ const CONSTANTS = {
         /(?:^|[_.])(?:token|password|secret|credential|auth_key|access_key|private_key)$/i,
     ],
     MAX_CONSECUTIVE_FLUSH: 5,
+    EXCEPTION_EVENT_NAME: '$Exception',
+    EXCEPTION_STACK_LINE_MAX_LENGTH: 1024,
+    EXCEPTION_FRAMES_MAX_COUNT: 30,
+    EXCEPTION_FRAME_PATH_MAX_LENGTH: 1000,
+    EXCEPTION_DEDUP_WINDOW_MS: 30 * 1000,
+    EXCEPTION_DEDUP_KEY_MAX_LEN: 256,
+    EXCEPTION_DEDUP_MAP_MAX_SIZE: 1000,
+    EXCEPTION_MAX_PER_SESSION: 20,
+    NATIVE_CRASH_MAX_RECORDS: 10,
+    NATIVE_CRASH_EXPIRY_MS: 30 * 24 * 60 * 60 * 1000,
+    NATIVE_CRASH_FILE_NAME: 'sensorswave_pending_crashes.json',
+    PENDING_CRASHES_GLOBAL_KEY: '__sensorswave_pending_crashes__',
+    LAST_CRASH_TS_KEY: 'sw_last_crash_ts',
+    EXCEPTION_CRASH_RECHECK_DELAYS_MS: [5000, 15000, 30000],
 };
 
 class SafeStorage {
@@ -219,6 +235,15 @@ class Store {
     }
     getLoginId() {
         return this._storage.getItem(CONSTANTS.LOGIN_ID_KEY) || '';
+    }
+    clearLoginId() {
+        this._storage.removeItem(CONSTANTS.LOGIN_ID_KEY);
+    }
+    resetAnonId() {
+        this._storage.removeItem(CONSTANTS.ANON_ID_KEY);
+    }
+    clearABData() {
+        this._storage.removeItem(CONSTANTS.AB_DATA_KEY);
     }
     registerCommonProperties(props) {
         for (const [key, value] of Object.entries(props)) {
@@ -490,11 +515,19 @@ class BatchSender {
         logger.info('[BatchSender] POST', { url, headers, data: allEvents });
         const finish = (response) => {
             try {
-                if (response.statusCode === 200) {
+                const statusCode = response.statusCode;
+                if (statusCode === 200) {
+                    this._queue.dequeue(allIds);
+                }
+                else if (statusCode >= 400 &&
+                    statusCode < 500 &&
+                    statusCode !== 408 &&
+                    statusCode !== 429) {
+                    logger.warn('Batch send rejected (4xx), drop events:', statusCode, response.text);
                     this._queue.dequeue(allIds);
                 }
                 else {
-                    logger.warn('Batch send failed:', response.statusCode, response.text);
+                    logger.warn('Batch send failed:', statusCode, response.text);
                 }
             }
             catch (e) {
@@ -2117,6 +2150,20 @@ class PluginManager {
     }
 }
 
+const GAME_EVENT_SHOW = 'game_on_show';
+const GAME_EVENT_HIDE = 'game_on_hide';
+function resolveGameEventName(game, name, fallback) {
+    try {
+        if (typeof game?.[name] === 'string')
+            return game[name];
+        const ctor = game?.constructor;
+        if (typeof ctor?.[name] === 'string')
+            return ctor[name];
+    }
+    catch {
+    }
+    return fallback;
+}
 class GameLifecyclePlugin {
     constructor(opts) {
         this.NAME = 'GameLifecycle';
@@ -2125,6 +2172,8 @@ class GameLifecyclePlugin {
         this._onShowHandler = null;
         this._onHideHandler = null;
         this._onShareHandler = null;
+        this._showEventName = GAME_EVENT_SHOW;
+        this._hideEventName = GAME_EVENT_HIDE;
         this._destroyed = false;
         this._initTimer = null;
         this._store = opts.store;
@@ -2145,8 +2194,10 @@ class GameLifecyclePlugin {
         this._onHideHandler = () => this._handleHide();
         try {
             if (this._ccGame && typeof this._ccGame.on === 'function') {
-                this._ccGame.on(this._ccGame.EVENT_SHOW, this._onShowHandler);
-                this._ccGame.on(this._ccGame.EVENT_HIDE, this._onHideHandler);
+                this._showEventName = resolveGameEventName(this._ccGame, 'EVENT_SHOW', GAME_EVENT_SHOW);
+                this._hideEventName = resolveGameEventName(this._ccGame, 'EVENT_HIDE', GAME_EVENT_HIDE);
+                this._ccGame.on(this._showEventName, this._onShowHandler);
+                this._ccGame.on(this._hideEventName, this._onHideHandler);
             }
         }
         catch (e) {
@@ -2386,9 +2437,9 @@ class GameLifecyclePlugin {
         }
         if (this._ccGame && typeof this._ccGame.off === 'function') {
             if (this._onShowHandler)
-                this._ccGame.off(this._ccGame.EVENT_SHOW, this._onShowHandler);
+                this._ccGame.off(this._showEventName, this._onShowHandler);
             if (this._onHideHandler)
-                this._ccGame.off(this._ccGame.EVENT_HIDE, this._onHideHandler);
+                this._ccGame.off(this._hideEventName, this._onHideHandler);
         }
         if (this._onShareHandler) {
             try {
@@ -2600,6 +2651,778 @@ class UTMPlugin {
     }
 }
 UTMPlugin.NAME = 'UTM';
+
+const ERROR_STRING_PATTERN = /^(?:Uncaught (?:exception: )?)?((?:Eval|Internal|Range|Reference|Syntax|Type|URI)Error): ([\s\S]*)$/;
+const OBJECT_MESSAGE_MAX_LEN = 512;
+function truncate(str, max) {
+    return str.length > max ? str.slice(0, max) : str;
+}
+function parseErrorString(input) {
+    const firstLine = input.split(/\r?\n/, 1)[0];
+    const match = firstLine.match(ERROR_STRING_PATTERN);
+    if (match) {
+        return { type: match[1], message: match[2].trim(), stack: '' };
+    }
+    return { type: 'Error', message: input.trim(), stack: '' };
+}
+function isErrorLike(input) {
+    return (typeof input === 'object' &&
+        input !== null &&
+        (typeof input.message === 'string' || typeof input.stack === 'string'));
+}
+function safeStringify(value) {
+    try {
+        return JSON.stringify(value) ?? String(value);
+    }
+    catch {
+        return String(value);
+    }
+}
+function normalizeException(input) {
+    try {
+        if (input == null) {
+            return { type: 'Error', message: '', stack: '' };
+        }
+        if (typeof input === 'string') {
+            return parseErrorString(input);
+        }
+        if (isErrorLike(input)) {
+            const obj = input;
+            const ctorName = obj.constructor?.name;
+            const type = (typeof obj.name === 'string' && obj.name) ||
+                (typeof ctorName === 'string' && ctorName !== 'Object' ? ctorName : '') ||
+                'Error';
+            const message = typeof obj.message === 'string' ? obj.message.trim() : '';
+            const stack = typeof obj.stack === 'string' ? obj.stack : '';
+            return { type, message, stack };
+        }
+        if (typeof input === 'number' || typeof input === 'boolean' || typeof input === 'bigint') {
+            return { type: 'Error', message: String(input), stack: '' };
+        }
+        return {
+            type: 'Error',
+            message: truncate(safeStringify(input), OBJECT_MESSAGE_MAX_LEN),
+            stack: '',
+        };
+    }
+    catch {
+        return { type: 'Error', message: '', stack: '' };
+    }
+}
+function normalizeOnErrorArgs(message, source, lineno, colno, error) {
+    try {
+        if (error != null) {
+            const fromError = normalizeException(error);
+            if (fromError.type !== 'Error' || fromError.message || fromError.stack) {
+                return fromError;
+            }
+        }
+        let msg = message;
+        if (msg != null && typeof msg !== 'string') {
+            msg = typeof msg.message === 'string' ? msg.message : safeStringify(msg);
+        }
+        const normalized = typeof msg === 'string' && msg.length > 0
+            ? parseErrorString(msg)
+            : { type: 'Error', message: '', stack: '' };
+        if (!normalized.stack && typeof source === 'string' && source.length > 0) {
+            normalized.stack = `at ${source}:${lineno ?? 0}:${colno ?? 0}`;
+        }
+        return normalized;
+    }
+    catch {
+        return { type: 'Error', message: '', stack: '' };
+    }
+}
+function normalizeRejectionReason(reason) {
+    try {
+        if (reason == null) {
+            return { type: 'UnhandledRejection', message: 'unknown reason', stack: '' };
+        }
+        if (typeof reason === 'string') {
+            return parseErrorString(reason);
+        }
+        if (isErrorLike(reason)) {
+            return normalizeException(reason);
+        }
+        if (typeof reason === 'number' || typeof reason === 'boolean' || typeof reason === 'bigint') {
+            return { type: 'UnhandledRejection', message: String(reason), stack: '' };
+        }
+        return {
+            type: 'UnhandledRejection',
+            message: truncate(safeStringify(reason), OBJECT_MESSAGE_MAX_LEN),
+            stack: '',
+        };
+    }
+    catch {
+        return { type: 'UnhandledRejection', message: 'unknown reason', stack: '' };
+    }
+}
+function normalizeCocosErrorHandler(...args) {
+    try {
+        const strings = args.filter((a) => typeof a === 'string' && a.length > 0);
+        if (strings.length === 0) {
+            return { type: 'Error', message: '', stack: '' };
+        }
+        const first = args[0];
+        if (args.length >= 3 && typeof args[1] === 'number') {
+            const file = first;
+            const line = args[1];
+            const message = args[2];
+            const normalized = typeof message === 'string' && message.length > 0
+                ? parseErrorString(message)
+                : { type: 'Error', message: '', stack: '' };
+            if (!normalized.stack && typeof file === 'string' && file.length > 0) {
+                normalized.stack = `at ${file}:${line}`;
+            }
+            return normalized;
+        }
+        if (args.length >= 3 && typeof args[2] === 'number') {
+            const normalized = typeof first === 'string' && first.length > 0
+                ? parseErrorString(first)
+                : { type: 'Error', message: '', stack: '' };
+            const file = args[1];
+            const line = args[2];
+            if (!normalized.stack && typeof file === 'string' && file.length > 0) {
+                normalized.stack = `at ${file}:${line}`;
+            }
+            return normalized;
+        }
+        if (args.length >= 3) {
+            const location = first;
+            const message = args[1];
+            const stack = args[2];
+            const msgStr = typeof message === 'string' && message.length > 0 ? message.trim() : '';
+            const stackStr = typeof stack === 'string' ? stack : '';
+            let type = 'Error';
+            let messageText = msgStr;
+            const msgMatch = msgStr.split(/\r?\n/, 1)[0].match(ERROR_STRING_PATTERN);
+            if (msgMatch) {
+                type = msgMatch[1];
+                messageText = msgMatch[2].trim();
+            }
+            else {
+                const stackMatch = stackStr.split(/\r?\n/, 1)[0].match(ERROR_STRING_PATTERN);
+                if (stackMatch) {
+                    type = stackMatch[1];
+                    if (messageText.length === 0)
+                        messageText = stackMatch[2].trim();
+                }
+            }
+            const stackText = stackStr.length > 0
+                ? stackStr
+                : typeof location === 'string' && location.length > 0
+                    ? `at ${location}`
+                    : '';
+            return { type, message: messageText, stack: stackText };
+        }
+        return parseErrorString(strings[0]);
+    }
+    catch {
+        return { type: 'Error', message: '', stack: '' };
+    }
+}
+function normalizeNativeCrash(record) {
+    try {
+        if (typeof record !== 'object' || record === null)
+            return null;
+        const r = record;
+        if (typeof r.timestamp !== 'number' || !Number.isFinite(r.timestamp))
+            return null;
+        return {
+            type: (typeof r.type === 'string' && r.type) || 'Unknown',
+            message: typeof r.message === 'string' ? r.message : '',
+            stack: typeof r.stack === 'string' ? r.stack : '',
+            timestamp: r.timestamp,
+            ...(Array.isArray(r.images) && r.images.length > 0 ? { images: r.images } : {}),
+        };
+    }
+    catch {
+        return null;
+    }
+}
+
+const V8_PAREN_FRAME = /^\s*at\s+(?:async\s+)?(.+?)\s+\((.+?):(\d+)(?::(\d+))?\)\s*$/;
+const V8_BARE_FRAME = /^\s*at\s+(?:async\s+)?([^\s()]+?):(\d+)(?::(\d+))?\s*$/;
+const GECKO_FRAME = /^(?:(.*)@)?(.+?):(\d+):(\d+)$/;
+const JAVA_FRAME = /^\s*at\s+([^\s(]+)\((.*)\)\s*$/;
+const JAVA_LOCATION = /^(.*):(\d+)$/;
+const IOS_FRAME = /^\s*\d+\s+(\S+)\s+0x([0-9a-fA-F]+)\s*(.*)$/;
+const IOS_OFFSET_SUFFIX = /\s+\+\s*\d+$/;
+const IOS_FILE_SUFFIX = /\s+\((.+):(\d+)\)$/;
+const NATIVE_FRAME = /^\s*#(\d+)\s+pc\s+(?:0x)?([0-9a-fA-F]+)\s+([^\s(]+)\s*(.*)$/;
+const NATIVE_SYMBOL_SUFFIX = /\((.*)\)\s*$/;
+const NATIVE_OFFSET_SUFFIX = /\+(?:0x)?[0-9a-fA-F]+$/;
+function getCurrentOrigin() {
+    try {
+        const w = globalThis.window;
+        const origin = w && w.location && w.location.origin;
+        return typeof origin === 'string' ? origin : '';
+    }
+    catch {
+        return '';
+    }
+}
+function capPath(str, max) {
+    return str.length > max ? str.slice(0, max) : str;
+}
+function normalizeHexAddr(raw) {
+    const hex = raw.toLowerCase().replace(/^0x/, '');
+    return `0x${hex.padStart(16, '0')}`;
+}
+function cleanFrameFile(file, origin) {
+    let cleaned = file;
+    const pageOrigin = origin !== undefined ? origin : getCurrentOrigin();
+    if (pageOrigin && cleaned.indexOf(pageOrigin) === 0) {
+        cleaned = cleaned.substring(pageOrigin.length);
+    }
+    const qIdx = cleaned.indexOf('?');
+    if (qIdx > -1) {
+        cleaned = cleaned.substring(0, qIdx);
+    }
+    const hIdx = cleaned.indexOf('#');
+    if (hIdx > -1) {
+        cleaned = cleaned.substring(0, hIdx);
+    }
+    return cleaned;
+}
+function buildWebFrame(fn, rawFile, lineno, colno, pageOrigin) {
+    const function_ = !fn || fn === '<anonymous>' ? '?' : fn;
+    const frame = {
+        platform: 'web:javascript',
+        filename: capPath(cleanFrameFile(rawFile, pageOrigin), CONSTANTS.EXCEPTION_FRAME_PATH_MAX_LENGTH),
+        function: function_,
+        lineno: Number(lineno),
+        abs_path: capPath(rawFile, CONSTANTS.EXCEPTION_FRAME_PATH_MAX_LENGTH),
+    };
+    if (colno !== undefined) {
+        frame.colno = Number(colno);
+    }
+    return frame;
+}
+function parseJavaFrame(line) {
+    const match = line.match(JAVA_FRAME);
+    if (!match)
+        return null;
+    const qualified = match[1];
+    const location = match[2] ?? '';
+    const dotIdx = qualified.lastIndexOf('.');
+    if (dotIdx <= 0 || dotIdx === qualified.length - 1)
+        return null;
+    const frame = {
+        platform: 'java',
+        module: qualified.substring(0, dotIdx),
+        function: qualified.substring(dotIdx + 1),
+    };
+    const locMatch = location.match(JAVA_LOCATION);
+    if (locMatch) {
+        frame.filename = capPath(cleanFrameFile(locMatch[1]), CONSTANTS.EXCEPTION_FRAME_PATH_MAX_LENGTH);
+        frame.lineno = Number(locMatch[2]);
+    }
+    return frame;
+}
+function parseIosFrame(line) {
+    const match = line.match(IOS_FRAME);
+    if (!match)
+        return null;
+    const image = match[1];
+    let symbol = match[3] ?? '';
+    const frame = {
+        platform: 'cocoa',
+        module: image,
+        instruction_addr: normalizeHexAddr(match[2]),
+    };
+    const fileMatch = symbol.match(IOS_FILE_SUFFIX);
+    if (fileMatch) {
+        frame.filename = capPath(cleanFrameFile(fileMatch[1]), CONSTANTS.EXCEPTION_FRAME_PATH_MAX_LENGTH);
+        frame.lineno = Number(fileMatch[2]);
+        symbol = symbol.substring(0, fileMatch.index);
+    }
+    symbol = symbol.replace(IOS_OFFSET_SUFFIX, '').trim();
+    frame.function = symbol.length === 0 || symbol.indexOf('0x') === 0 ? '?' : symbol;
+    return frame;
+}
+function parseNativeFrame(line) {
+    const match = line.match(NATIVE_FRAME);
+    if (!match)
+        return null;
+    const rawPath = match[3];
+    const slashIdx = rawPath.lastIndexOf('/');
+    const module = slashIdx > -1 ? rawPath.substring(slashIdx + 1) : rawPath;
+    const frame = {
+        platform: 'native',
+        module: capPath(module, CONSTANTS.EXCEPTION_FRAME_PATH_MAX_LENGTH),
+        filename: capPath(cleanFrameFile(module), CONSTANTS.EXCEPTION_FRAME_PATH_MAX_LENGTH),
+        instruction_addr: normalizeHexAddr(match[2]),
+    };
+    const symMatch = (match[4] ?? '').trim().match(NATIVE_SYMBOL_SUFFIX);
+    const symbol = (symMatch && symMatch[1] ? symMatch[1] : '')
+        .replace(NATIVE_OFFSET_SUFFIX, '')
+        .trim();
+    frame.function = symbol.length === 0 || symbol.indexOf('0x') === 0 ? '?' : symbol;
+    return frame;
+}
+function parseLine(line, pageOrigin) {
+    const v8Paren = line.match(V8_PAREN_FRAME);
+    if (v8Paren) {
+        return buildWebFrame(v8Paren[1], v8Paren[2], v8Paren[3], v8Paren[4], pageOrigin);
+    }
+    const v8Bare = line.match(V8_BARE_FRAME);
+    if (v8Bare) {
+        return buildWebFrame(undefined, v8Bare[1], v8Bare[2], v8Bare[3], pageOrigin);
+    }
+    const gecko = line.match(GECKO_FRAME);
+    if (gecko) {
+        return buildWebFrame(gecko[1], gecko[2], gecko[3], gecko[4], pageOrigin);
+    }
+    return parseJavaFrame(line) ?? parseIosFrame(line) ?? parseNativeFrame(line);
+}
+function parseExceptionFrames(stack, pageOrigin) {
+    try {
+        if (typeof stack !== 'string' || stack.length === 0)
+            return [];
+        const origin = pageOrigin !== undefined ? pageOrigin : getCurrentOrigin();
+        const frames = [];
+        const lines = stack.split(/\r?\n/);
+        for (const line of lines) {
+            if (!line || line.length > CONSTANTS.EXCEPTION_STACK_LINE_MAX_LENGTH)
+                continue;
+            const frame = parseLine(line, origin);
+            if (frame) {
+                frames.push(frame);
+                if (frames.length >= CONSTANTS.EXCEPTION_FRAMES_MAX_COUNT)
+                    break;
+            }
+        }
+        frames.reverse();
+        return frames;
+    }
+    catch {
+        return [];
+    }
+}
+function enrichIosFrames(frames, images) {
+    try {
+        if (!Array.isArray(images) || images.length === 0)
+            return;
+        const byName = new Map();
+        for (const img of images) {
+            if (typeof img !== 'object' || img === null)
+                continue;
+            const rec = img;
+            if (typeof rec.name !== 'string' || rec.name.length === 0)
+                continue;
+            if (typeof rec.base !== 'string' || !/^0x[0-9a-fA-F]+$/.test(rec.base))
+                continue;
+            byName.set(rec.name, {
+                base: normalizeHexAddr(rec.base),
+                debug_id: typeof rec.debug_id === 'string' && rec.debug_id.length > 0 ? rec.debug_id : undefined,
+            });
+        }
+        if (byName.size === 0)
+            return;
+        for (const frame of frames) {
+            if (frame.platform !== 'cocoa' || !frame.module)
+                continue;
+            const img = byName.get(frame.module);
+            if (!img)
+                continue;
+            frame.image_addr = img.base;
+            if (img.debug_id) {
+                frame.debug_id = img.debug_id;
+            }
+        }
+    }
+    catch {
+    }
+}
+
+function readWatermark(storage) {
+    if (!storage)
+        return 0;
+    try {
+        const raw = storage.getItem(CONSTANTS.LAST_CRASH_TS_KEY);
+        const ts = Number(raw);
+        return raw != null && Number.isFinite(ts) ? ts : 0;
+    }
+    catch {
+        return 0;
+    }
+}
+function readPendingCrashes(storage) {
+    try {
+        const injected = globalThis[CONSTANTS.PENDING_CRASHES_GLOBAL_KEY];
+        if (injected == null)
+            return [];
+        let list = injected;
+        if (typeof injected === 'string') {
+            if (injected.length === 0)
+                return [];
+            list = JSON.parse(injected);
+        }
+        if (!Array.isArray(list))
+            return [];
+        const watermark = readWatermark(storage);
+        return list
+            .map((item) => normalizeNativeCrash(item))
+            .filter((r) => r != null && r.timestamp > watermark)
+            .sort((a, b) => a.timestamp - b.timestamp);
+    }
+    catch {
+        return [];
+    }
+}
+function markCrashesReported(maxTimestamp, storage) {
+    if (!storage || !Number.isFinite(maxTimestamp))
+        return;
+    try {
+        if (maxTimestamp > readWatermark(storage)) {
+            storage.setItem(CONSTANTS.LAST_CRASH_TS_KEY, String(maxTimestamp));
+        }
+    }
+    catch {
+    }
+}
+
+const APP_HOOK_FLAG = '__sensorswave_exception_hooked__';
+class ExceptionPlugin {
+    constructor(opts) {
+        this.NAME = 'Exception';
+        this._dedupMap = new Map();
+        this._sessionCount = 0;
+        this._sessionCapWarned = false;
+        this._h5Window = null;
+        this._h5PrevOnError = null;
+        this._h5OnErrorWrapper = null;
+        this._h5RejectionHandler = null;
+        this._mpErrorHandler = null;
+        this._mpRejectionHandler = null;
+        this._appErrorHandler = null;
+        this._appPrevErrorHandler = null;
+        this._appHookInstalled = false;
+        this._ohosHookActive = false;
+        this._crashRecheckTimers = [];
+        this._send = opts.send;
+        this._platformAdapter = opts.platformAdapter;
+        this._safeStorage = opts.safeStorage;
+        this._enableCrashTrack = !!opts.enableCrashTrack;
+        this._enableErrorTrack = !!opts.enableErrorTrack;
+        this._enqueueEvent = opts.enqueueEvent;
+        this._flushImmediate = opts.flushImmediate;
+        this._isOptedOut = opts.isOptedOut ?? (() => false);
+    }
+    init() {
+        const platformType = this._platformAdapter.getPlatformType();
+        if (this._enableCrashTrack && platformType !== 'app') {
+            logger.info(`[Exception] enableCrashTrack only takes effect on app platform, ignored on ${platformType}`);
+        }
+        if (platformType === 'app' && this._enableCrashTrack) {
+            this._reportPendingNativeCrashes();
+            this._scheduleCrashRechecks();
+        }
+        if (!this._enableErrorTrack)
+            return;
+        try {
+            if (platformType === 'h5') {
+                this._installH5Hooks();
+            }
+            else if (platformType === 'minigame') {
+                this._installMinigameHooks();
+            }
+            else if (platformType === 'app') {
+                this._installAppHook();
+            }
+        }
+        catch (e) {
+            logger.warn('[Exception] Failed to install error hooks:', e);
+        }
+    }
+    trackException(throwable, properties) {
+        try {
+            const normalized = normalizeException(throwable);
+            this._emit('error', normalized, properties);
+        }
+        catch (e) {
+            logger.warn('[Exception] trackException failed:', e);
+        }
+    }
+    destroy() {
+        this._clearCrashRechecks();
+        this._destroyH5Hooks();
+        this._destroyMinigameHooks();
+        this._destroyAppHook();
+    }
+    _reportPendingNativeCrashes() {
+        if (this._isOptedOut())
+            return;
+        const records = readPendingCrashes(this._safeStorage);
+        if (records.length === 0)
+            return;
+        let lastEmittedTs = 0;
+        for (const record of records) {
+            const emitted = this._reportAuto({ type: record.type, message: record.message, stack: record.stack }, 'fatal', record.images);
+            if (emitted) {
+                lastEmittedTs = Math.max(lastEmittedTs, record.timestamp);
+            }
+        }
+        if (lastEmittedTs > 0) {
+            markCrashesReported(lastEmittedTs, this._safeStorage);
+        }
+    }
+    _scheduleCrashRechecks() {
+        try {
+            for (const delay of CONSTANTS.EXCEPTION_CRASH_RECHECK_DELAYS_MS) {
+                this._crashRecheckTimers.push(setTimeout(() => this._reportPendingNativeCrashes(), delay));
+            }
+        }
+        catch (e) {
+            logger.warn('[Exception] Failed to schedule crash rechecks:', e);
+        }
+    }
+    _clearCrashRechecks() {
+        for (const timer of this._crashRecheckTimers) {
+            clearTimeout(timer);
+        }
+        this._crashRecheckTimers = [];
+    }
+    _reportAuto(normalized, level = 'error', images) {
+        try {
+            if (this._isOptedOut())
+                return false;
+            const key = `${normalized.type}|` +
+                `${normalized.message.slice(0, CONSTANTS.EXCEPTION_DEDUP_KEY_MAX_LEN)}`;
+            const now = Date.now();
+            const last = this._dedupMap.get(key);
+            if (last != null && now - last < CONSTANTS.EXCEPTION_DEDUP_WINDOW_MS) {
+                return false;
+            }
+            if (this._dedupMap.size >= CONSTANTS.EXCEPTION_DEDUP_MAP_MAX_SIZE) {
+                this._dedupMap.clear();
+            }
+            this._dedupMap.set(key, now);
+            return this._emit(level, normalized, undefined, images);
+        }
+        catch (e) {
+            logger.warn('[Exception] auto report failed:', e);
+            return false;
+        }
+    }
+    _emit(level, normalized, properties, images) {
+        if (this._isOptedOut())
+            return false;
+        if (this._sessionCount >= CONSTANTS.EXCEPTION_MAX_PER_SESSION) {
+            if (!this._sessionCapWarned) {
+                logger.warn(`[Exception] Session limit (${CONSTANTS.EXCEPTION_MAX_PER_SESSION}) reached, dropping further exceptions`);
+                this._sessionCapWarned = true;
+            }
+            return false;
+        }
+        const frames = parseExceptionFrames(normalized.stack);
+        enrichIosFrames(frames, images);
+        const props = {
+            ...(properties || {}),
+            $exception_level: level,
+            $exception_type: normalized.type,
+            $exception_message: normalized.message,
+        };
+        if (frames.length > 0) {
+            props.$exception_frames = frames;
+        }
+        else {
+            delete props.$exception_frames;
+        }
+        const event = this._send.sendEvent(CONSTANTS.EXCEPTION_EVENT_NAME, props);
+        this._enqueueEvent(event);
+        this._sessionCount++;
+        this._flushImmediate();
+        return true;
+    }
+    _installH5Hooks() {
+        const g = globalThis;
+        const w = g.window;
+        if (!w) {
+            logger.warn('[Exception] window not available, skip H5 error hooks');
+            return;
+        }
+        try {
+            this._h5Window = w;
+            this._h5PrevOnError = typeof w.onerror === 'function' ? w.onerror : null;
+            this._h5OnErrorWrapper = (message, source, lineno, colno, error) => {
+                try {
+                    this._reportAuto(normalizeOnErrorArgs(message, source, lineno, colno, error));
+                }
+                catch {
+                }
+                const prev = this._h5PrevOnError;
+                if (typeof prev === 'function') {
+                    try {
+                        return prev.call(w, message, source, lineno, colno, error);
+                    }
+                    catch {
+                    }
+                }
+                return undefined;
+            };
+            w.onerror = this._h5OnErrorWrapper;
+            this._h5RejectionHandler = (ev) => {
+                try {
+                    const reason = ev && ev.reason !== undefined ? ev.reason : ev;
+                    this._reportAuto(normalizeRejectionReason(reason));
+                }
+                catch {
+                }
+            };
+            if (typeof w.addEventListener === 'function') {
+                w.addEventListener('unhandledrejection', this._h5RejectionHandler);
+            }
+        }
+        catch (e) {
+            logger.warn('[Exception] Failed to install H5 error hooks:', e);
+        }
+    }
+    _destroyH5Hooks() {
+        if (!this._h5Window)
+            return;
+        try {
+            const w = this._h5Window;
+            if (this._h5OnErrorWrapper && w.onerror === this._h5OnErrorWrapper) {
+                if (this._h5PrevOnError) {
+                    w.onerror = this._h5PrevOnError;
+                }
+                else {
+                    delete w.onerror;
+                }
+            }
+            if (this._h5RejectionHandler && typeof w.removeEventListener === 'function') {
+                w.removeEventListener('unhandledrejection', this._h5RejectionHandler);
+            }
+        }
+        catch {
+        }
+        this._h5Window = null;
+        this._h5PrevOnError = null;
+        this._h5OnErrorWrapper = null;
+        this._h5RejectionHandler = null;
+    }
+    _installMinigameHooks() {
+        try {
+            const sdk = getMPSDK();
+            if (!sdk) {
+                logger.warn('[Exception] MP SDK global not found, skip minigame error hooks');
+                return;
+            }
+            if (typeof sdk.onError === 'function') {
+                this._mpErrorHandler = (err) => {
+                    try {
+                        this._reportAuto(normalizeException(err));
+                    }
+                    catch {
+                    }
+                };
+                sdk.onError(this._mpErrorHandler);
+            }
+            if (typeof sdk.onUnhandledRejection === 'function') {
+                this._mpRejectionHandler = (res) => {
+                    try {
+                        const reason = res && res.reason !== undefined ? res.reason : res;
+                        this._reportAuto(normalizeRejectionReason(reason));
+                    }
+                    catch {
+                    }
+                };
+                sdk.onUnhandledRejection(this._mpRejectionHandler);
+            }
+        }
+        catch (e) {
+            logger.warn('[Exception] Failed to install minigame error hooks:', e);
+        }
+    }
+    _destroyMinigameHooks() {
+        try {
+            const sdk = getMPSDK();
+            if (sdk) {
+                if (this._mpErrorHandler && typeof sdk.offError === 'function') {
+                    sdk.offError(this._mpErrorHandler);
+                }
+                if (this._mpRejectionHandler && typeof sdk.offUnhandledRejection === 'function') {
+                    sdk.offUnhandledRejection(this._mpRejectionHandler);
+                }
+            }
+        }
+        catch {
+        }
+        this._mpErrorHandler = null;
+        this._mpRejectionHandler = null;
+    }
+    _installAppHook() {
+        const g = globalThis;
+        try {
+            if (g[APP_HOOK_FLAG] === true)
+                return;
+            const jsbObj = g.jsb;
+            if (jsbObj && typeof jsbObj.swInstallExceptionHook === 'function') {
+                jsbObj.swInstallExceptionHook((location, linenum, message, stack) => {
+                    this._ohosDispatchException(location, linenum, message, stack);
+                });
+                this._ohosHookActive = true;
+                logger.info('[Exception] OHOS jsvm exception hook installed (jsb.swInstallExceptionHook)');
+            }
+            this._appPrevErrorHandler = typeof g.__errorHandler === 'function' ? g.__errorHandler : null;
+            this._appErrorHandler = (...args) => {
+                try {
+                    this._reportAuto(normalizeCocosErrorHandler(...args));
+                }
+                catch {
+                }
+                const prev = this._appPrevErrorHandler;
+                if (typeof prev === 'function') {
+                    try {
+                        prev(...args);
+                    }
+                    catch {
+                    }
+                }
+            };
+            g.__errorHandler = this._appErrorHandler;
+            g[APP_HOOK_FLAG] = true;
+            this._appHookInstalled = true;
+        }
+        catch (e) {
+            logger.warn('[Exception] Failed to install app error hook:', e);
+        }
+    }
+    _ohosDispatchException(location, linenum, message, stack) {
+        if (!this._ohosHookActive)
+            return;
+        try {
+            this._reportAuto(normalizeCocosErrorHandler(location, linenum, message, stack));
+        }
+        catch {
+        }
+    }
+    _destroyAppHook() {
+        if (!this._appHookInstalled)
+            return;
+        const g = globalThis;
+        try {
+            if (this._appErrorHandler && g.__errorHandler === this._appErrorHandler) {
+                if (this._appPrevErrorHandler) {
+                    g.__errorHandler = this._appPrevErrorHandler;
+                }
+                else {
+                    delete g.__errorHandler;
+                }
+            }
+            delete g[APP_HOOK_FLAG];
+        }
+        catch {
+        }
+        this._appErrorHandler = null;
+        this._appPrevErrorHandler = null;
+        this._appHookInstalled = false;
+        this._ohosHookActive = false;
+    }
+}
+ExceptionPlugin.NAME = 'Exception';
 
 var ABType;
 (function (ABType) {
@@ -2856,6 +3679,7 @@ class Sensorswave {
         this._pluginManager = new PluginManager(this._emitter);
         this._pluginManager.register(GameLifecyclePlugin);
         this._pluginManager.register(UTMPlugin);
+        this._pluginManager.register(ExceptionPlugin);
         if (mergedConfig.enableAB) {
             this._pluginManager.register(ABTestPlugin);
         }
@@ -2874,6 +3698,9 @@ class Sensorswave {
             refreshInterval: mergedConfig.abRefreshInterval,
             requestFn: this._requestFn,
             enableShareTrack: mergedConfig.enableShareTrack,
+            safeStorage,
+            enableCrashTrack: mergedConfig.enableCrashTrack,
+            enableErrorTrack: mergedConfig.enableErrorTrack,
             isOptedOut: () => this._optOutCapturing,
             enqueueEvent: (event) => this._enqueuePluginEvent(event),
             flushImmediate: () => {
@@ -2921,6 +3748,23 @@ class Sensorswave {
         const event = this._send.sendEvent(eventData.event, eventData.properties, eventData.user_properties, eventData.subject_properties);
         this._enqueueEvent(event);
     }
+    trackException(throwable, properties) {
+        if (!this._ensureInited())
+            return;
+        if (this._optOutCapturing)
+            return;
+        const plugin = this._pluginManager.getPlugin('Exception');
+        if (!plugin) {
+            logger.warn('Exception plugin not available');
+            return;
+        }
+        try {
+            plugin.trackException(throwable, properties);
+        }
+        catch (e) {
+            logger.warn('trackException failed:', e);
+        }
+    }
     identify(loginId) {
         if (!this._ensureInited())
             return;
@@ -2943,6 +3787,17 @@ class Sensorswave {
         if (this._optOutCapturing)
             return;
         this._store.setLoginId(String(loginId));
+    }
+    reset(resetAnonId) {
+        if (!this._ensureInited())
+            return;
+        if (this._optOutCapturing)
+            return;
+        this._store.clearLoginId();
+        if (resetAnonId) {
+            this._store.resetAnonId();
+        }
+        this._store.clearABData();
     }
     getAnonId() {
         if (!this._store || this._optOutCapturing)

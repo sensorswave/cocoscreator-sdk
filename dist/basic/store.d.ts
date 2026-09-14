@@ -8,6 +8,9 @@ export declare class Store {
     getAnonId(): string;
     setLoginId(loginId: string): void;
     getLoginId(): string;
+    clearLoginId(): void;
+    resetAnonId(): void;
+    clearABData(): void;
     registerCommonProperties(props: Record<string, any>): void;
     clearCommonProperties(keys?: string[]): void;
     getCommonProperties(): Record<string, any>;
