@@ -9,6 +9,10 @@ export declare const CONSTANTS: {
     ANON_ID_KEY: string;
     LOGIN_ID_KEY: string;
     AB_DATA_KEY: string;
+    SESSION_STORAGE_KEY: string;
+    SESSION_IDLE_TIMEOUT_MS: number;
+    SESSION_MAX_DURATION_MS: number;
+    SESSION_ACTIVITY_FLUSH_MS: number;
     LAUNCHED_KEY: string;
     OPT_OUT_KEY: string;
     INSTALL_TIME_KEY: string;

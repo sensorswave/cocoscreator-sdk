@@ -464,6 +464,7 @@ try {
 | `reset(resetAnonId?)` | 用户登出时调用，解除登录 ID 与设备的绑定。默认保留匿名 ID；传 `true` 同时重置匿名 ID。同时清除 AB 实验缓存。**不发送**任何事件。 |
 | `getLoginId()`        | 获取当前登录 ID，返回 `string`。                                        |
 | `getAnonId()`         | 获取当前匿名 ID（SDK 初始化时自动生成并持久化），返回 `string`。                      |
+| `getSessionId()`      | 获取当前会话 ID（UUIDv7，SDK 自动生成并注入所有事件的 `$session_id`），返回 `string`；init 前或 opt-out（禁用采集）期间返回空字符串。 |
 
 ```typescript
 // 登录
@@ -483,6 +484,7 @@ Sensorswave.reset(true);
 > - `reset()` 仅清除登录 ID；`reset(true)` 会生成**新的匿名 ID**（下次 `getAnonId()` 时惰性生成），此前的匿名 ID 不再使用。
 > - 两种形式均会清除 AB 实验缓存（实验分组与用户身份绑定，登出后不沿用登录用户的分组结果）。
 > - init 前调用为空操作；opt-out（禁用采集）期间为空操作。
+> - `getSessionId()` 返回的会话在超过 30 分钟无事件活动、持续超过 12 小时或调用 `reset()` 后轮转为新会话；同一浏览器的多个标签页/窗口共享同一会话。
 
 ### 3.4 用户属性
 
@@ -534,9 +536,10 @@ Sensorswave.registerCommonProperties({
   server_id: 'cn-east-1',
   game_version: '1.0.0',
   current_level: () => getPlayerLevel(),
-  session_id: () => getSessionId(),
 });
 ```
+
+> 说明：会话 ID 无需手动注册——SDK 已自动在所有事件中注入 `$session_id`（见预置属性文档「会话相关属性」）。如需读取当前会话 ID，调用 `Sensorswave.getSessionId()`。
 
 #### `clearCommonProperties(keys?)`
 

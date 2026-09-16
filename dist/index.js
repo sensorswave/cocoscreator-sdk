@@ -1,4 +1,4 @@
-const SDK_VERSION = '1.2.0';
+const SDK_VERSION = '1.3.0';
 
 const DEFAULT_CONFIG = {
     debug: false,
@@ -21,6 +21,10 @@ const CONSTANTS = {
     ANON_ID_KEY: 'sw_anon_id',
     LOGIN_ID_KEY: 'sw_login_id',
     AB_DATA_KEY: 'sw_ab_data',
+    SESSION_STORAGE_KEY: 'sw_session',
+    SESSION_IDLE_TIMEOUT_MS: 30 * 60 * 1000,
+    SESSION_MAX_DURATION_MS: 12 * 60 * 60 * 1000,
+    SESSION_ACTIVITY_FLUSH_MS: 5000,
     LAUNCHED_KEY: 'sw_launched',
     OPT_OUT_KEY: 'sw_opt_out',
     INSTALL_TIME_KEY: 'sw_install_time',
@@ -214,6 +218,36 @@ function generateUUID$1() {
         const v = c === 'x' ? r : (r & 0x3) | 0x8;
         return v.toString(16);
     });
+}
+function generateUUIDv7() {
+    const ts = Date.now();
+    const bytes = new Uint8Array(16);
+    if (typeof crypto !== 'undefined' && typeof crypto.getRandomValues === 'function') {
+        crypto.getRandomValues(bytes);
+    }
+    else {
+        for (let i = 0; i < 16; i++) {
+            bytes[i] = (Math.random() * 256) | 0;
+        }
+    }
+    bytes[0] = ts / 2 ** 40;
+    bytes[1] = ts / 2 ** 32;
+    bytes[2] = ts / 2 ** 24;
+    bytes[3] = ts / 2 ** 16;
+    bytes[4] = ts / 2 ** 8;
+    bytes[5] = ts;
+    bytes[6] = 0x70 | (bytes[6] & 0x0f);
+    bytes[8] = 0x80 | (bytes[8] & 0x3f);
+    const hex = Array.from(bytes)
+        .map((b) => b.toString(16).padStart(2, '0'))
+        .join('');
+    return [
+        hex.slice(0, 8),
+        hex.slice(8, 12),
+        hex.slice(12, 16),
+        hex.slice(16, 20),
+        hex.slice(20, 32),
+    ].join('-');
 }
 
 class Store {
@@ -583,10 +617,11 @@ class BatchSender {
 }
 
 class Send {
-    constructor(store, presetProps) {
+    constructor(store, presetProps, session) {
         this._utmProvider = null;
         this._store = store;
         this._presetProps = presetProps;
+        this._session = session;
     }
     setUtmProvider(provider) {
         this._utmProvider = provider;
@@ -605,6 +640,7 @@ class Send {
             event.login_id = loginId;
         const utmProps = this._utmProvider ? this._utmProvider() : {};
         const mergedProps = this.buildEnrichedProperties(properties || {}, utmProps);
+        mergedProps.$session_id = this._session.getSessionId({ recordActivity: true });
         if (Object.keys(mergedProps).length > 0) {
             event.properties = mergedProps;
         }
@@ -726,6 +762,64 @@ class PresetProperties {
     invalidateCache() {
         this._cache = null;
         this._cacheTimestamp = 0;
+    }
+}
+
+const UUID_SHAPE_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
+class SessionManager {
+    constructor(storage) {
+        this._lastPersistedActivityTs = 0;
+        this._storage = storage;
+    }
+    getSessionId(options) {
+        const recordActivity = !!options?.recordActivity;
+        const now = Date.now();
+        let state = this._read();
+        if (!state ||
+            now < state.last_ts ||
+            now < state.start_ts ||
+            now - state.last_ts > CONSTANTS.SESSION_IDLE_TIMEOUT_MS ||
+            now - state.start_ts > CONSTANTS.SESSION_MAX_DURATION_MS) {
+            state = { id: generateUUIDv7(), start_ts: now, last_ts: now };
+            this._lastPersistedActivityTs = now;
+            this._write(state);
+            return state.id;
+        }
+        if (recordActivity) {
+            state.last_ts = now;
+            if (now - this._lastPersistedActivityTs >= CONSTANTS.SESSION_ACTIVITY_FLUSH_MS) {
+                this._lastPersistedActivityTs = now;
+                this._write(state);
+            }
+        }
+        return state.id;
+    }
+    reset() {
+        this._storage.removeItem(CONSTANTS.SESSION_STORAGE_KEY);
+        this._lastPersistedActivityTs = 0;
+    }
+    _read() {
+        const raw = this._storage.getItem(CONSTANTS.SESSION_STORAGE_KEY);
+        if (!raw)
+            return null;
+        try {
+            const parsed = JSON.parse(raw);
+            if (!parsed ||
+                typeof parsed.id !== 'string' ||
+                !UUID_SHAPE_RE.test(parsed.id) ||
+                typeof parsed.start_ts !== 'number' ||
+                typeof parsed.last_ts !== 'number' ||
+                parsed.last_ts < parsed.start_ts) {
+                return null;
+            }
+            return parsed;
+        }
+        catch {
+            return null;
+        }
+    }
+    _write(state) {
+        this._storage.setItem(CONSTANTS.SESSION_STORAGE_KEY, JSON.stringify(state));
     }
 }
 
@@ -3601,6 +3695,8 @@ class ABTestPlugin {
         });
     }
     _trackFeatureImpress(abData, unset = false) {
+        if (this._isOptedOut())
+            return;
         const userProps = unset
             ? { $unset: { [getABPropKey(abData)]: null } }
             : { $set: { [getABPropKey(abData)]: abData.vid } };
@@ -3608,6 +3704,8 @@ class ABTestPlugin {
         this._enqueueEvent(event);
     }
     _trackExpImpress(abData, unset = false) {
+        if (this._isOptedOut())
+            return;
         const userProps = unset
             ? { $unset: { [getABPropKey(abData)]: null } }
             : { $set: { [getABPropKey(abData)]: abData.vid } };
@@ -3634,6 +3732,7 @@ class Sensorswave {
         this._batchSendEnabled = false;
         this._send = null;
         this._presetProps = null;
+        this._sessionManager = null;
         this._pluginManager = null;
         this._emitter = new EventEmitter();
         this._sourceToken = '';
@@ -3675,7 +3774,8 @@ class Sensorswave {
         const platformType = detectPlatform(ccSys);
         const platformAdapter = createPlatformAdapter(platformType, ccSys, mergedConfig.getSceneName, platformType === 'app' ? mergedConfig.getDeviceInfo : undefined);
         this._presetProps = new PresetProperties(platformAdapter);
-        this._send = new Send(this._store, this._presetProps);
+        this._sessionManager = new SessionManager(safeStorage);
+        this._send = new Send(this._store, this._presetProps, this._sessionManager);
         this._pluginManager = new PluginManager(this._emitter);
         this._pluginManager.register(GameLifecyclePlugin);
         this._pluginManager.register(UTMPlugin);
@@ -3798,6 +3898,7 @@ class Sensorswave {
             this._store.resetAnonId();
         }
         this._store.clearABData();
+        this._sessionManager.reset();
     }
     getAnonId() {
         if (!this._store || this._optOutCapturing)
@@ -3808,6 +3909,11 @@ class Sensorswave {
         if (!this._store || this._optOutCapturing)
             return '';
         return this._store.getLoginId();
+    }
+    getSessionId() {
+        if (!this._sessionManager || this._optOutCapturing)
+            return '';
+        return this._sessionManager.getSessionId();
     }
     getPlugins() {
         if (!this._pluginManager)
@@ -3948,6 +4054,7 @@ class Sensorswave {
         this._batchSendEnabled = false;
         this._send = null;
         this._presetProps = null;
+        this._sessionManager = null;
         this._pluginManager = null;
     }
     _profileOp(operator, props) {

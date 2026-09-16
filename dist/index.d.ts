@@ -8,6 +8,7 @@ declare class Sensorswave {
     private _batchSendEnabled;
     private _send;
     private _presetProps;
+    private _sessionManager;
     private _pluginManager;
     private _emitter;
     private _sourceToken;
@@ -30,6 +31,7 @@ declare class Sensorswave {
     reset(resetAnonId?: boolean): void;
     getAnonId(): string;
     getLoginId(): string;
+    getSessionId(): string;
     getPlugins(): Map<string, unknown>;
     registerCommonProperties(props: Record<string, any>): void;
     clearCommonProperties(keys?: string[]): void;
