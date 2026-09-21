@@ -60,7 +60,7 @@ public class SensorsWaveBridge extends ContentProvider {
     private static final String PENDING_CRASHES_KEY = "__sensorswave_pending_crashes__";
     private static final String CRASH_FILE_NAME = "sensorswave_pending_crashes.json";
     private static final int MAX_CRASH_RECORDS = 10;
-    private static final long CRASH_EXPIRY_MS = 30L * 24 * 3600 * 1000;
+    private static final long CRASH_EXPIRY_MS = 7L * 24 * 3600 * 1000;
     private static Thread.UncaughtExceptionHandler sPreviousCrashHandler;
 
     @Override
@@ -449,7 +449,7 @@ public class SensorsWaveBridge extends ContentProvider {
     }
 
     /**
-     * 读取已落盘的崩溃记录（boot 裁剪：丢弃 >30 天的过期记录）。
+     * 读取已落盘的崩溃记录（boot 裁剪：丢弃 >7 天的过期记录）。
      * ⚠️ 水位线机制：原生**永不**因"已注入/已上报"删除记录（JS 侧用 localStorage
      * 水位线过滤），裁剪只防文件无限增长（上限 10 条在 append 时保证）。
      */

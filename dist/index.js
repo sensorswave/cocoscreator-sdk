@@ -1,4 +1,4 @@
-const SDK_VERSION = '1.3.0';
+const SDK_VERSION = '1.3.1';
 
 const DEFAULT_CONFIG = {
     debug: false,
@@ -56,7 +56,7 @@ const CONSTANTS = {
     EXCEPTION_DEDUP_MAP_MAX_SIZE: 1000,
     EXCEPTION_MAX_PER_SESSION: 20,
     NATIVE_CRASH_MAX_RECORDS: 10,
-    NATIVE_CRASH_EXPIRY_MS: 30 * 24 * 60 * 60 * 1000,
+    NATIVE_CRASH_EXPIRY_MS: 7 * 24 * 60 * 60 * 1000,
     NATIVE_CRASH_FILE_NAME: 'sensorswave_pending_crashes.json',
     PENDING_CRASHES_GLOBAL_KEY: '__sensorswave_pending_crashes__',
     LAST_CRASH_TS_KEY: 'sw_last_crash_ts',

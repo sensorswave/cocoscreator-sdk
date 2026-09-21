@@ -654,14 +654,14 @@ static void sensorswaveSignalHandler(int sig, siginfo_t *info, void *uap) {
 
 /**
  * 读取已落盘的崩溃记录。boot 时做两级裁剪：
- *   - 丢弃 >30 天的过期记录
+ *   - 丢弃 >7 天的过期记录
  *   - 只保留最新 10 条
  * ⚠️ 水位线机制：原生**永不**因"已注入/已上报"删除记录（JS 侧用 localStorage
  * 水位线过滤），这里的裁剪只防文件无限增长。
  */
 + (NSArray *)loadPendingCrashRecords {
     NSString *path = [self pendingCrashesFilePath];
-    NSTimeInterval cutoff = [[NSDate date] timeIntervalSince1970] - 30 * 24 * 3600;
+    NSTimeInterval cutoff = [[NSDate date] timeIntervalSince1970] - 7 * 24 * 3600;
     NSMutableArray *kept = [NSMutableArray array];
 
     NSData *data = [NSData dataWithContentsOfFile:path];

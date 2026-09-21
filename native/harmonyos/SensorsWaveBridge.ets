@@ -80,7 +80,7 @@ const NET_TYPE_KEY = '__sensorswave_network_type__';
 const PENDING_CRASHES_KEY = '__sensorswave_pending_crashes__';
 const KEY_PENDING_CRASHES = '__sensorswave_pending_crashes_pref__';
 const MAX_CRASH_RECORDS = 10;
-const CRASH_EXPIRY_MS = 30 * 24 * 3600 * 1000;
+const CRASH_EXPIRY_MS = 7 * 24 * 3600 * 1000;
 // watcher 名系统约束：仅小写字母 / 数字 / 下划线
 const CRASH_WATCHER_NAME = 'sw_exception_watcher';
 // 补报轮询：hiAppEvent 故障事件异步到达（晚于 boot 的一次性注入），worker 线程
@@ -563,7 +563,7 @@ hilog.info(DOMAIN, TAG, `module loaded`);
 
 /**
  * 读取文件 store 中的待补报崩溃记录。
- * boot 裁剪：丢弃 >30 天的过期记录。逐条防御式校验（timestamp 必须是有限数字，
+ * boot 裁剪：丢弃 >7 天的过期记录。逐条防御式校验（timestamp 必须是有限数字，
  * JS 侧水位线过滤依赖其单调可比）。
  * ⚠️ 水位线机制：原生**永不**因"已注入/已上报"删除记录（JS 侧用 localStorage
  * 水位线过滤），裁剪只防存储无限增长（上限 10 条在 append 时保证）。
