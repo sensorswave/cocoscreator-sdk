@@ -35,7 +35,10 @@ export declare class GameLifecyclePlugin implements IPlugin {
     private _flushImmediate;
     private _destroyed;
     private _initTimer;
+    private _appEndTimer;
     private _isOptedOut;
+    private _h5BeforeUnloadHandler;
+    private _h5LoadHandler;
     constructor(opts: GameLifecycleOpts);
     init(): void;
     private _initAppLifecycle;
@@ -47,12 +50,14 @@ export declare class GameLifecyclePlugin implements IPlugin {
     private _trackAppInstall;
     private _handleAppShow;
     private _handleAppHide;
+    private _replayPendingAppEndAtLaunch;
+    private _flushPendingAppEnd;
+    private _clearAppEndTimer;
     private _extractLaunchProps;
     private _trackMPLaunch;
     private _handleMPShow;
     private _handleMPHide;
     private _trackH5PageView;
-    private _scheduleH5PageLoad;
     private _trackH5PageLoad;
     private _handleH5PageLeave;
     private _initShareTracking;

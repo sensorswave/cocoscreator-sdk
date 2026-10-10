@@ -41,8 +41,8 @@
  *
  * 启动后会在 JS 引擎 globalThis 上注入：
  *   - globalThis.__sensorswave_app_info__：{ appId, appName, appVersion, region,
- *     model, brand, manufacturer, deviceId }
- *   - globalThis.__sensorswave_network_type__：'LAN' | 'WWAN' | 'NONE'
+ *     language, model, brand, manufacturer, deviceId }
+ *   - globalThis.__sensorswave_network_type__：'LAN' | 'WWAN' | 'NONE' | 'ETHERNET'
  *   - globalThis.__sensorswave_pending_crashes__：上次崩溃记录数组（fatal 补报数据源）
  *
  * ⚠️ appName 永远为空字符串：Stage 模型下 appInfo.label 是 "$string:app_name"
@@ -92,13 +92,15 @@ const CRASH_POLL_MAX_ROUNDS = 30;
 // 引用。必须 module-level（不是 class 成员），让 setTimeout / network 回调里也能拿到。
 let evalJsFn: ((code: string) => void) | null = null;
 
-type NetworkType = 'LAN' | 'WWAN' | 'NONE';
+type NetworkType = 'LAN' | 'WWAN' | 'NONE' | 'ETHERNET';
 
 interface AppInfoJson {
   appId: string;
   appName: string;
   appVersion: string;
   region: string;
+  /** BCP 47 语言标签（zh-Hans-CN），JS 侧 $language 直接采用 */
+  language: string;
   model: string;
   brand: string;
   manufacturer: string;
@@ -423,10 +425,24 @@ function readRegion(): string {
 }
 
 /**
+ * BCP 47 语言标签（zh-Hans-CN / en-US），JS 侧 $language 直接采用。
+ * cc.sys.language 只有 'zh'/'en' 短码拿不到地区子标签，必须由桥注入完整标签。
+ */
+function readLanguage(): string {
+  try {
+    return i18n.System.getAppPreferredLanguage() || '';
+  } catch (e) {
+    hilog.warn(DOMAIN, TAG, `getAppPreferredLanguage failed: ${JSON.stringify(e)}`);
+    return '';
+  }
+}
+
+/**
  * 映射 connection bearer types 到业务网络类型：
- *   WiFi / Ethernet / VPN → LAN
- *   Cellular               → WWAN
- *   其它 / 无网络          → NONE
+ *   WiFi / VPN  → LAN
+ *   Ethernet    → ETHERNET（JS 侧归一化为小写 'ethernet'）
+ *   Cellular    → WWAN（JS 侧归一化为 'cellular'）
+ *   其它 / 无网络 → NONE（无网不下发）
  *
  * ArkTS 适配：getNetCapabilitiesSync() 必须传 NetHandle（先用 getDefaultNetSync 拿）。
  */
@@ -439,12 +455,11 @@ function readNetworkType(): NetworkType {
     const bearers: connection.NetBearType[] = netCap.bearerTypes || [];
     for (let i = 0; i < bearers.length; i++) {
       const b = bearers[i];
-      if (
-        b === connection.NetBearType.BEARER_WIFI ||
-        b === connection.NetBearType.BEARER_ETHERNET ||
-        b === connection.NetBearType.BEARER_VPN
-      ) {
+      if (b === connection.NetBearType.BEARER_WIFI || b === connection.NetBearType.BEARER_VPN) {
         return 'LAN';
+      }
+      if (b === connection.NetBearType.BEARER_ETHERNET) {
+        return 'ETHERNET';
       }
       if (b === connection.NetBearType.BEARER_CELLULAR) {
         return 'WWAN';
@@ -465,11 +480,13 @@ function buildAppInfoSync(deviceId: string): AppInfoJson {
   const bundle = readBundleInfo();
   const dev = readDeviceInfo();
   const region = readRegion();
+  const language = readLanguage();
   return {
     appId: bundle.appId,
     appName: '',
     appVersion: bundle.appVersion,
     region,
+    language,
     model: dev.model,
     brand: dev.brand,
     manufacturer: dev.manufacturer,

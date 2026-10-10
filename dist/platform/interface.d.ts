@@ -44,4 +44,7 @@ type MiniGameSDK = {
 export declare function getMPSDK(): MiniGameSDK | null;
 export declare function safeCall<T = any>(sdk: MiniGameSDK | null, method: string): T | null;
 export declare function detectPlatform(ccSys: any): PlatformType;
-export declare function createPlatformAdapter(platformType: PlatformType, ccSys: any, getSceneName?: () => string, getDeviceInfo?: GetDeviceInfoFn): IPlatformAdapter;
+export declare function createPlatformAdapter(platformType: PlatformType, ccSys: any, getSceneName?: () => string, getDeviceInfo?: GetDeviceInfoFn, isOptedOut?: () => boolean): IPlatformAdapter;
+export declare function normalizeNetworkType(networkType: string): string;
+export declare function normalizeBcp47Language(lang: string): string;
+export declare function normalizeRegionCode(region: string): string;

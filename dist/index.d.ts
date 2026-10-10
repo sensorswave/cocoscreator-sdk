@@ -16,6 +16,7 @@ declare class Sensorswave {
     private _requestFn;
     private _optOutCapturing;
     private _persistOptOut;
+    private _platformAdapter;
     constructor();
     init(sourceToken: string, config: SensorswaveConfig): void;
     trackEvent(eventName: string, properties?: Record<string, any>): void;
@@ -24,6 +25,10 @@ declare class Sensorswave {
         properties?: Record<string, any>;
         user_properties?: UserProperties;
         subject_properties?: Record<string, any>;
+        time?: number;
+        trace_id?: string;
+        anon_id?: string;
+        login_id?: string;
     }): void;
     trackException(throwable: unknown, properties?: Record<string, any>): void;
     identify(loginId: string): void;
@@ -61,4 +66,4 @@ declare class Sensorswave {
 declare const sensorswave: Sensorswave;
 export default sensorswave;
 export { Sensorswave };
-export type { SensorswaveConfig, ExceptionLevel, ExceptionPlatform, ExceptionFrame } from './types';
+export type { SensorswaveConfig, ExceptionConfig, ExceptionLevel, ExceptionPlatform, ExceptionFrame, } from './types';

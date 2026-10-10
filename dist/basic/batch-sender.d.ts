@@ -10,6 +10,10 @@ export declare class BatchSender {
     private _destroyed;
     private _paused;
     private _started;
+    private _watchdogTimer;
+    private _currentFinish;
+    private _consecutiveFailures;
+    private _warnedRetryIds;
     constructor(queue: PersistentQueue, requestFn: (config: RequestConfig) => void, maxBatchSize?: number, flushInterval?: number);
     start(): void;
     pause(): void;
@@ -19,8 +23,14 @@ export declare class BatchSender {
     flush(): void;
     flushImmediate(): void;
     private _doFlush;
+    private _settleFlushGuarded;
+    private _onFlushSettled;
+    private _nextFlushDelay;
+    private _warnExcessiveRetries;
     private _getSendableItems;
     private _startFlushTimer;
     private _clearFlushTimer;
+    private _startWatchdog;
+    private _clearWatchdog;
     destroy(): void;
 }

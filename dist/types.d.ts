@@ -16,8 +16,9 @@ export interface SensorswaveConfig {
     persistOptOut?: boolean;
     getSceneName?: () => string;
     getDeviceInfo?: () => NativeDeviceInfo | Promise<NativeDeviceInfo>;
+    exceptionConfig?: ExceptionConfig;
 }
-export type RequiredConfig = Required<Omit<SensorswaveConfig, 'sourceToken' | 'apiHost' | 'getSceneName' | 'getDeviceInfo'>>;
+export type RequiredConfig = Required<Omit<SensorswaveConfig, 'sourceToken' | 'apiHost' | 'getSceneName' | 'getDeviceInfo' | 'exceptionConfig'>>;
 export interface SensorswaveSendEvent {
     event: string;
     time: number;
@@ -124,6 +125,10 @@ export interface NormalizedException {
     stack: string;
 }
 export type ExceptionPlatform = 'web:javascript' | 'java' | 'dart' | 'hermes' | 'cocoa' | 'native';
+export interface ExceptionConfig {
+    inAppIncludes?: string[];
+    inAppExcludes?: string[];
+}
 export interface ExceptionFrame {
     platform: ExceptionPlatform;
     filename?: string;
@@ -135,6 +140,7 @@ export interface ExceptionFrame {
     instruction_addr?: string;
     image_addr?: string;
     debug_id?: string;
+    in_app?: boolean;
 }
 export interface NativeCrashImage {
     name: string;
@@ -154,6 +160,8 @@ export interface IPlatformAdapter {
     getDynamicProperties(): Record<string, any>;
     getLaunchOptions(): Record<string, any>;
     getInstallTime?(): number | null;
+    onOptIn?(): void;
+    dispose?(): void;
 }
 export interface IPlugin {
     NAME: string;

@@ -340,6 +340,14 @@ static void sensorswaveSignalHandler(int sig, siginfo_t *info, void *uap) {
         info[@"region"] = region;
     }
 
+    // BCP 47 语言标签（zh-Hans-CN / en-US），JS 侧 $language 直接采用。
+    // cc.sys.language 只有 'zh'/'en' 短码拿不到地区子标签；preferredLanguages
+    // 首项即当前生效语言（iOS 13+ 跟随 App 单独的语言设置）。
+    NSString *language = [[NSLocale preferredLanguages] firstObject];
+    if (!IsNullOrEmpty(language)) {
+        info[@"language"] = language;
+    }
+
     BOOL ok = [self setGlobalProperty:@"__sensorswave_app_info__" withDictionary:info];
     if (!ok) {
         NSError *err2 = nil;
@@ -392,17 +400,25 @@ static void sensorswaveSignalHandler(int sig, siginfo_t *info, void *uap) {
     nw_path_monitor_set_update_handler(monitor, ^(nw_path_t path) {
         nw_path_status_t status = nw_path_get_status(path);
         BOOL isWiFi = nw_path_uses_interface_type(path, nw_interface_type_wifi);
-        NSString *type = [self nwPathStatusToType:status isWiFi:isWiFi];
-        NSLog(@"[SensorsWaveBridge] Network changed: %@ (isWiFi=%d, status=%d)", type, isWiFi, (int)status);
+        BOOL isWired = nw_path_uses_interface_type(path, nw_interface_type_wired);
+        NSString *type = [self nwPathStatusToType:status isWiFi:isWiFi isWired:isWired];
+        NSLog(@"[SensorsWaveBridge] Network changed: %@ (isWiFi=%d, isWired=%d, status=%d)",
+              type, isWiFi, isWired, (int)status);
         [self injectNetworkType:type];
     });
 
     nw_path_monitor_start(monitor);
 }
 
-+ (NSString *)nwPathStatusToType:(nw_path_status_t)status isWiFi:(BOOL)isWiFi {
+// 输出值与 JS 侧 normalizeNetworkType 的输入约定对齐：
+//   LAN → wifi；ETHERNET → ethernet；WWAN → cellular；NONE → 无网（不下发）
++ (NSString *)nwPathStatusToType:(nw_path_status_t)status isWiFi:(BOOL)isWiFi isWired:(BOOL)isWired {
     if (status == nw_path_status_satisfied) {
-        return isWiFi ? @"LAN" : @"WWAN";
+        // WiFi 优先，与 Android（TRANSPORT_WIFI 先判）/ HarmonyOS（BEARER_WIFI 先判）
+        // 的优先级保持一致；仅有线时才落到 ETHERNET
+        if (isWiFi) return @"LAN";
+        if (isWired) return @"ETHERNET";
+        return @"WWAN";
     }
     return @"NONE";
 }

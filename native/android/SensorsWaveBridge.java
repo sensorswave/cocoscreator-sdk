@@ -199,6 +199,12 @@ public class SensorsWaveBridge extends ContentProvider {
             String region = Locale.getDefault().getCountry();
             if (region != null && !region.isEmpty()) info.put("region", region);
 
+            // BCP 47 语言标签（zh-CN），JS 侧 $language 直接采用。
+            // cc.sys.language 只有 'zh'/'en' 短码拿不到地区子标签；
+            // toLanguageTag 需 API 21+，低版本退化为 language[-COUNTRY] 手拼。
+            String language = tryGetLanguageTag();
+            if (language != null && !language.isEmpty()) info.put("language", language);
+
             String model = Build.MODEL;
             if (model != null) info.put("model", model);
 
@@ -284,6 +290,23 @@ public class SensorsWaveBridge extends ContentProvider {
         }
     }
 
+    /** BCP 47 语言标签（zh-CN）；toLanguageTag 需 API 21+，低版本用 language[-COUNTRY] 手拼。 */
+    private String tryGetLanguageTag() {
+        try {
+            Locale locale = Locale.getDefault();
+            if (Build.VERSION.SDK_INT >= 21) {
+                return locale.toLanguageTag();
+            }
+            String lang = locale.getLanguage();
+            String country = locale.getCountry();
+            if (lang == null || lang.isEmpty()) return "";
+            return country == null || country.isEmpty() ? lang : lang + "-" + country;
+        } catch (Throwable t) {
+            Log.e(TAG, "tryGetLanguageTag failed", t);
+            return "";
+        }
+    }
+
     private String readCurrentNetworkType() {
         try {
             ConnectivityManager cm = (ConnectivityManager) sContext.getSystemService(Context.CONNECTIVITY_SERVICE);
@@ -304,13 +327,13 @@ public class SensorsWaveBridge extends ContentProvider {
                 || Build.MODEL.contains("sdk_gphone");
             if (isEmulator) {
                 if (caps.hasTransport(NetworkCapabilities.TRANSPORT_WIFI)) return "LAN";
-                if (caps.hasTransport(NetworkCapabilities.TRANSPORT_ETHERNET)) return "LAN";
+                if (caps.hasTransport(NetworkCapabilities.TRANSPORT_ETHERNET)) return "ETHERNET";
                 if (caps.hasTransport(NetworkCapabilities.TRANSPORT_VPN)) return "LAN";
                 return "LAN";
             }
 
             if (caps.hasTransport(NetworkCapabilities.TRANSPORT_WIFI)) return "LAN";
-            if (caps.hasTransport(NetworkCapabilities.TRANSPORT_ETHERNET)) return "LAN";
+            if (caps.hasTransport(NetworkCapabilities.TRANSPORT_ETHERNET)) return "ETHERNET";
             if (caps.hasTransport(NetworkCapabilities.TRANSPORT_VPN)) return "LAN";
             if (caps.hasTransport(NetworkCapabilities.TRANSPORT_CELLULAR)) return "WWAN";
             if (caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET) &&

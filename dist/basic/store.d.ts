@@ -1,5 +1,5 @@
 import { SafeStorage } from '../utils/safe-storage';
-import type { ABData } from '../types';
+import type { ABData, SensorswaveSendEvent } from '../types';
 export declare class Store {
     private _storage;
     private _commonProps;
@@ -16,6 +16,13 @@ export declare class Store {
     getCommonProperties(): Record<string, any>;
     getABData(): ABData[];
     saveABData(results: ABData[]): void;
+    savePendingAppEnd(event: SensorswaveSendEvent, hideTs: number, startTs: number): boolean;
+    getPendingAppEnd(): {
+        hideTs: number;
+        startTs: number;
+        event: SensorswaveSendEvent;
+    } | null;
+    clearPendingAppEnd(): void;
     setLaunched(): void;
     isLaunched(): boolean;
     getInstallTime(): number | null;

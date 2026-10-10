@@ -32,9 +32,9 @@ export declare class ABTestPlugin implements IPlugin {
     private _refreshInterval;
     private _requestFn;
     private _fetchingPromise;
+    private _fetchTimeoutTimer;
     private _refreshTimer;
     private _enqueueEvent;
-    private _lastFetchTime;
     private _isOptedOut;
     constructor(opts: ABTestOpts);
     init(): void;

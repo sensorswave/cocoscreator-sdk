@@ -8,6 +8,7 @@ export interface NativeDeviceInfo {
     model?: string;
     osVersion?: string;
     region?: string;
+    language?: string;
     installTime?: number;
 }
 export type GetDeviceInfoFn = (() => NativeDeviceInfo | Promise<NativeDeviceInfo>) | null | undefined;
@@ -18,6 +19,8 @@ export declare class NativeBridge {
     private _sys;
     private _networkTypeCache;
     private _networkEventsSubscribed;
+    private _networkEventHandler;
+    private _networkEventBindings;
     private _networkPollTimer;
     private _networkPollCount;
     private static readonly NETWORK_POLL_MAX;

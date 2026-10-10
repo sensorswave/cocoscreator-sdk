@@ -6,6 +6,8 @@ export declare const CONSTANTS: {
     MAX_QUEUE_SIZE: number;
     DATA_EXPIRY_MS: number;
     QUEUE_STORAGE_KEY: string;
+    APP_END_DEBOUNCE_MS: number;
+    PENDING_APP_END_KEY: string;
     ANON_ID_KEY: string;
     LOGIN_ID_KEY: string;
     AB_DATA_KEY: string;
@@ -22,17 +24,15 @@ export declare const CONSTANTS: {
     MAX_RETRY_COUNT: number;
     BASE_RETRY_DELAY: number;
     MAX_RETRY_DELAY: number;
-    FLUSH_RETRY_BACKOFF_BASE: number;
-    FLUSH_RETRY_BACKOFF_MAX: number;
     LIB_VALUE: string;
     SDK_VERSION: string;
-    DEFAULT_CONFIG: Required<Omit<import("./types").SensorswaveConfig, "sourceToken" | "apiHost" | "getSceneName" | "getDeviceInfo">>;
+    DEFAULT_CONFIG: Required<Omit<import("./types").SensorswaveConfig, "sourceToken" | "apiHost" | "getSceneName" | "getDeviceInfo" | "exceptionConfig">>;
     UTM_KEYS: readonly ["utm_source", "utm_medium", "utm_campaign", "utm_content", "utm_term"];
     TRACK_ENDPOINT: string;
     AB_ENDPOINT: string;
     REQUEST_TIMEOUT: number;
+    REQUEST_WATCHDOG_DELAY_MS: number;
     SENSITIVE_KEY_PATTERNS: readonly RegExp[];
-    MAX_CONSECUTIVE_FLUSH: number;
     EXCEPTION_EVENT_NAME: string;
     EXCEPTION_STACK_LINE_MAX_LENGTH: number;
     EXCEPTION_FRAMES_MAX_COUNT: number;

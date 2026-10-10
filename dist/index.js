@@ -1,4 +1,4 @@
-const SDK_VERSION = '1.3.1';
+const SDK_VERSION = '1.4.0';
 
 const DEFAULT_CONFIG = {
     debug: false,
@@ -18,6 +18,8 @@ const CONSTANTS = {
     MAX_QUEUE_SIZE: 200,
     DATA_EXPIRY_MS: 7 * 24 * 60 * 60 * 1000,
     QUEUE_STORAGE_KEY: 'sw_queue',
+    APP_END_DEBOUNCE_MS: 30 * 1000,
+    PENDING_APP_END_KEY: 'sw_pending_app_end',
     ANON_ID_KEY: 'sw_anon_id',
     LOGIN_ID_KEY: 'sw_login_id',
     AB_DATA_KEY: 'sw_ab_data',
@@ -34,8 +36,6 @@ const CONSTANTS = {
     MAX_RETRY_COUNT: 1,
     BASE_RETRY_DELAY: 1000,
     MAX_RETRY_DELAY: 30000,
-    FLUSH_RETRY_BACKOFF_BASE: 2000,
-    FLUSH_RETRY_BACKOFF_MAX: 60000,
     LIB_VALUE: 'cocosCreator',
     SDK_VERSION: SDK_VERSION,
     DEFAULT_CONFIG: DEFAULT_CONFIG,
@@ -43,10 +43,10 @@ const CONSTANTS = {
     TRACK_ENDPOINT: '/in/track',
     AB_ENDPOINT: '/ab/evalall',
     REQUEST_TIMEOUT: 30000,
+    REQUEST_WATCHDOG_DELAY_MS: 30000 + 5000,
     SENSITIVE_KEY_PATTERNS: [
         /(?:^|[_.])(?:token|password|secret|credential|auth_key|access_key|private_key)$/i,
     ],
-    MAX_CONSECUTIVE_FLUSH: 5,
     EXCEPTION_EVENT_NAME: '$Exception',
     EXCEPTION_STACK_LINE_MAX_LENGTH: 1024,
     EXCEPTION_FRAMES_MAX_COUNT: 30,
@@ -67,10 +67,17 @@ class SafeStorage {
     constructor(storage) {
         this._fallback = new Map();
         this._degraded = false;
+        this._probed = false;
+        this._storage = storage;
+        this._degraded = false;
+    }
+    _probe() {
+        if (this._probed)
+            return;
+        this._probed = true;
         try {
-            storage.setItem('__sw_test__', '1');
-            storage.removeItem('__sw_test__');
-            this._storage = storage;
+            this._storage.setItem('__sw_test__', '1');
+            this._storage.removeItem('__sw_test__');
             this._degraded = false;
         }
         catch {
@@ -91,6 +98,7 @@ class SafeStorage {
         }
     }
     setItem(key, value) {
+        this._probe();
         if (this._degraded) {
             this._fallback.set(key, value);
             return;
@@ -344,6 +352,37 @@ class Store {
         };
         this._storage.setItem(CONSTANTS.AB_DATA_KEY, JSON.stringify(data));
     }
+    savePendingAppEnd(event, hideTs, startTs) {
+        this._storage.setItem(CONSTANTS.PENDING_APP_END_KEY, JSON.stringify({ hideTs, startTs, event }));
+        return !this._storage.isDegraded;
+    }
+    getPendingAppEnd() {
+        const raw = this._storage.getItem(CONSTANTS.PENDING_APP_END_KEY);
+        if (!raw)
+            return null;
+        try {
+            const cached = JSON.parse(raw);
+            if (!cached ||
+                !Number.isFinite(cached.hideTs) ||
+                !Number.isFinite(cached.startTs) ||
+                !cached.event ||
+                cached.event.event !== '$AppEnd' ||
+                !Number.isFinite(cached.event.time)) {
+                return null;
+            }
+            if (Date.now() - cached.hideTs > CONSTANTS.DATA_EXPIRY_MS) {
+                this.clearPendingAppEnd();
+                return null;
+            }
+            return cached;
+        }
+        catch {
+            return null;
+        }
+    }
+    clearPendingAppEnd() {
+        this._storage.removeItem(CONSTANTS.PENDING_APP_END_KEY);
+    }
     setLaunched() {
         this._storage.setItem(CONSTANTS.LAUNCHED_KEY, '1');
     }
@@ -466,6 +505,20 @@ class PersistentQueue {
             this._persist();
         }
     }
+    incrementRetryCounts(ids) {
+        if (ids.length === 0)
+            return;
+        const idSet = new Set(ids);
+        let changed = false;
+        for (const item of this._queue) {
+            if (idSet.has(item.id)) {
+                item.retryCount++;
+                changed = true;
+            }
+        }
+        if (changed)
+            this._persist();
+    }
     markDead(id) {
         const item = this._queue.find((i) => i.id === id);
         if (item) {
@@ -482,6 +535,10 @@ class BatchSender {
         this._destroyed = false;
         this._paused = false;
         this._started = false;
+        this._watchdogTimer = null;
+        this._currentFinish = null;
+        this._consecutiveFailures = 0;
+        this._warnedRetryIds = new Set();
         this._queue = queue;
         this._requestFn = requestFn;
         this._maxBatchSize = maxBatchSize;
@@ -498,6 +555,8 @@ class BatchSender {
             return;
         this._paused = true;
         this._clearFlushTimer();
+        this._clearWatchdog();
+        this._currentFinish = null;
     }
     resume() {
         if (this._destroyed)
@@ -568,38 +627,83 @@ class BatchSender {
                 logger.error('Error in flush callback:', e);
             }
             finally {
-                if (this._isFlushing && !this._destroyed) {
-                    this._isFlushing = false;
-                    if (response.statusCode === 200 && this._queue.size > 0) {
-                        this.triggerFlush();
-                    }
-                    else {
-                        this._startFlushTimer();
-                    }
-                }
+                this._settleFlushGuarded(response.statusCode, allIds);
             }
         };
-        this._requestFn({
-            url,
-            method: 'POST',
-            data: allEvents,
-            headers,
-            callback: finish,
-        });
+        this._currentFinish = finish;
+        try {
+            this._requestFn({
+                url,
+                method: 'POST',
+                data: allEvents,
+                headers,
+                callback: finish,
+            });
+        }
+        catch (e) {
+            finish({ statusCode: 0, text: String(e) });
+            return;
+        }
+        this._startWatchdog();
+    }
+    _settleFlushGuarded(statusCode, ids) {
+        if (!this._isFlushing || this._destroyed || this._paused)
+            return;
+        this._isFlushing = false;
+        this._currentFinish = null;
+        this._clearWatchdog();
+        this._onFlushSettled(statusCode, ids);
+    }
+    _onFlushSettled(statusCode, ids) {
+        const dropped = statusCode >= 400 && statusCode < 500 && statusCode !== 408 && statusCode !== 429;
+        if (statusCode === 200 || dropped) {
+            this._consecutiveFailures = 0;
+            this._warnedRetryIds.clear();
+        }
+        else {
+            this._consecutiveFailures++;
+            this._queue.incrementRetryCounts(ids);
+            this._warnExcessiveRetries(ids);
+        }
+        if (statusCode === 200 && this._queue.size > 0) {
+            this.triggerFlush();
+        }
+        else {
+            this._startFlushTimer(this._nextFlushDelay());
+        }
+    }
+    _nextFlushDelay() {
+        if (this._consecutiveFailures === 0)
+            return this._flushInterval;
+        return Math.min(CONSTANTS.BASE_RETRY_DELAY * 2 ** (this._consecutiveFailures - 1), CONSTANTS.MAX_RETRY_DELAY);
+    }
+    _warnExcessiveRetries(ids) {
+        const idSet = new Set(ids);
+        for (const item of this._queue.peek(this._queue.size)) {
+            if (!idSet.has(item.id))
+                continue;
+            if (item.retryCount > CONSTANTS.MAX_RETRY_COUNT && !this._warnedRetryIds.has(item.id)) {
+                this._warnedRetryIds.add(item.id);
+                logger.warn(`Event retried ${item.retryCount} times (max ${CONSTANTS.MAX_RETRY_COUNT}), ` +
+                    `kept in queue for later retry: ${item.id}`);
+            }
+        }
     }
     _getSendableItems() {
         const all = this._queue.peek(this._queue.size);
         return all.filter((item) => !item.dead).slice(0, this._maxBatchSize);
     }
-    _startFlushTimer() {
+    _startFlushTimer(delay) {
         if (this._destroyed)
+            return;
+        if (this._paused)
             return;
         this._clearFlushTimer();
         this._flushTimer = setInterval(() => {
             if (this._queue.size > 0) {
                 this.triggerFlush();
             }
-        }, this._flushInterval);
+        }, delay ?? this._flushInterval);
     }
     _clearFlushTimer() {
         if (this._flushTimer) {
@@ -607,12 +711,36 @@ class BatchSender {
             this._flushTimer = null;
         }
     }
+    _startWatchdog() {
+        if (this._destroyed || !this._isFlushing)
+            return;
+        this._clearWatchdog();
+        this._watchdogTimer = setTimeout(() => {
+            this._watchdogTimer = null;
+            if (this._destroyed || this._paused || !this._isFlushing)
+                return;
+            const finish = this._currentFinish;
+            this._currentFinish = null;
+            logger.warn('[BatchSender] Request watchdog fired, synthesize failure');
+            finish?.({ statusCode: 0, text: 'Watchdog: request did not call back' });
+        }, CONSTANTS.REQUEST_WATCHDOG_DELAY_MS);
+    }
+    _clearWatchdog() {
+        if (this._watchdogTimer) {
+            clearTimeout(this._watchdogTimer);
+            this._watchdogTimer = null;
+        }
+    }
     destroy() {
         this._destroyed = true;
         this._clearFlushTimer();
+        this._clearWatchdog();
+        this._currentFinish = null;
         this._isFlushing = false;
         this._paused = false;
         this._started = false;
+        this._consecutiveFailures = 0;
+        this._warnedRetryIds.clear();
     }
 }
 
@@ -915,6 +1043,8 @@ class NativeBridge {
         this._inflight = null;
         this._networkTypeCache = null;
         this._networkEventsSubscribed = false;
+        this._networkEventHandler = null;
+        this._networkEventBindings = [];
         this._networkPollTimer = null;
         this._networkPollCount = 0;
         this._bridgeHealthCheckTimer = null;
@@ -935,15 +1065,24 @@ class NativeBridge {
                     return;
                 this._networkTypeCache = String(nt);
             };
+            this._networkEventHandler = handler;
+            const tryOn = (target, name) => {
+                try {
+                    if (target && typeof target.on === 'function') {
+                        target.on(name, handler);
+                        this._networkEventBindings.push({ target, name });
+                    }
+                }
+                catch {
+                }
+            };
             if (cc?.event?.on) {
-                cc.event.on('network-type-change', handler);
+                tryOn(cc.event, 'network-type-change');
                 if (cc.EventType && cc.EventType.NETWORK_TYPE_CHANGED) {
-                    cc.event.on(cc.EventType.NETWORK_TYPE_CHANGED, handler);
+                    tryOn(cc.event, cc.EventType.NETWORK_TYPE_CHANGED);
                 }
             }
-            if (cc?.sys?.on) {
-                cc.sys.on('network-type-change', handler);
-            }
+            tryOn(cc?.sys, 'network-type-change');
             this._networkEventsSubscribed = true;
         }
         catch {
@@ -1049,6 +1188,21 @@ class NativeBridge {
             }
             this._bridgeHealthCheckTimer = null;
         }
+        const handler = this._networkEventHandler;
+        if (handler) {
+            for (const { target, name } of this._networkEventBindings) {
+                try {
+                    if (target && typeof target.off === 'function') {
+                        target.off(name, handler);
+                    }
+                }
+                catch {
+                }
+            }
+        }
+        this._networkEventBindings = [];
+        this._networkEventHandler = null;
+        this._networkEventsSubscribed = false;
     }
     _scheduleBridgeHealthCheck() {
         if (this._bridgeHealthCheckTimer)
@@ -1132,6 +1286,7 @@ class NativeBridge {
         const result = this._readFromSys();
         const injectedAppInfo = this._readInjectedAppInfo();
         const platform = detectRuntimePlatform();
+        result.deviceId = injectedAppInfo.deviceId || result.deviceId || '';
         if (!result.deviceId)
             result.deviceId = this._readOrGenerateDeviceId();
         if (!result.appId) {
@@ -1160,6 +1315,7 @@ class NativeBridge {
             const sysRegion = platform === 'harmonyos' ? this._sys?.region || this._sys?.countryCode || '' : '';
             result.region = sysRegion || injectedAppInfo.region || '';
         }
+        result.language = injectedAppInfo.language || result.language || '';
         if (injectedAppInfo.model) {
             result.model = injectedAppInfo.model;
         }
@@ -1207,10 +1363,12 @@ class NativeBridge {
     }
     _readInjectedAppInfo() {
         const empty = {
+            deviceId: '',
             appId: '',
             appName: '',
             appVersion: '',
             region: '',
+            language: '',
             model: '',
             brand: '',
             manufacturer: '',
@@ -1234,10 +1392,12 @@ class NativeBridge {
                             ? rawFirst
                             : null;
                     return {
+                        deviceId: v.deviceId || v.device_id || '',
                         appId: v.appId || v.bundleId || v.packageName || '',
                         appName: v.appName || v.name || '',
                         appVersion: v.appVersion || v.version || '',
                         region: v.region || v.country || v.countryCode || '',
+                        language: v.language || v.appLanguage || '',
                         model: v.model || v.deviceModel || '',
                         brand: v.brand || v.deviceBrand || '',
                         manufacturer: v.manufacturer || v.deviceManufacturer || v.vendor || '',
@@ -1284,6 +1444,7 @@ class NativeBridge {
             model: info.model || sys.model,
             osVersion: info.osVersion || sys.osVersion,
             region: info.region || sys.region,
+            language: info.language || sys.language,
             installTime: info.installTime ?? sys.installTime,
         };
     }
@@ -1304,6 +1465,7 @@ class NativeBridge {
         setIf('model', 'model');
         setIf('osVersion', 'osVersion');
         setIf('region', 'region');
+        setIf('language', 'language');
         return result;
     }
     _isUseful(info) {
@@ -1551,10 +1713,10 @@ function detectPlatform(ccSys) {
     }
     return 'h5';
 }
-function createPlatformAdapter(platformType, ccSys, getSceneName, getDeviceInfo) {
+function createPlatformAdapter(platformType, ccSys, getSceneName, getDeviceInfo, isOptedOut) {
     switch (platformType) {
         case 'app':
-            return new AppPlatformAdapter(ccSys, getSceneName, getDeviceInfo);
+            return new AppPlatformAdapter(ccSys, getSceneName, getDeviceInfo, isOptedOut);
         case 'minigame':
             return new MPPlatformAdapter(ccSys, getSceneName);
         case 'h5':
@@ -1580,42 +1742,83 @@ function formatOsVersion(version) {
         .replace(/^OHOS[\s-]*/i, '')
         .trim();
 }
-const CC_NETWORK_TYPE_ENUM_MAP = {
-    '0': '',
-    '1': 'wifi',
-    '2': 'WWAN',
-    '3': '',
-};
-function isWifiNetworkType(networkType) {
-    if (!networkType)
-        return false;
-    const upper = networkType.toUpperCase();
-    if (upper === 'WIFI' || upper === 'LAN')
-        return true;
-    if (networkType === '1')
-        return true;
-    return false;
-}
 function normalizeNetworkType(networkType) {
     if (!networkType)
         return '';
-    if (Object.prototype.hasOwnProperty.call(CC_NETWORK_TYPE_ENUM_MAP, networkType)) {
-        return CC_NETWORK_TYPE_ENUM_MAP[networkType];
-    }
-    if (networkType.toUpperCase() === 'LAN')
+    const lower = String(networkType).toLowerCase();
+    if (lower === '0' || lower === '3')
+        return '';
+    if (lower === '1')
         return 'wifi';
-    return networkType;
+    if (lower === '2')
+        return 'cellular';
+    if (lower === 'lan' || lower === 'wifi')
+        return 'wifi';
+    if (lower === 'wwan' || lower === 'cellular')
+        return 'cellular';
+    if (lower === 'ethernet')
+        return 'ethernet';
+    if (lower === 'none' || lower === 'unknown')
+        return '';
+    if (lower === 'slow-2g')
+        return '2g';
+    return lower;
+}
+function isWifiNetworkType(networkType) {
+    return normalizeNetworkType(networkType) === 'wifi';
+}
+function normalizeBcp47Language(lang) {
+    if (!lang)
+        return '';
+    const parts = String(lang)
+        .replace(/_/g, '-')
+        .split('-')
+        .filter((p) => !!p);
+    if (parts.length === 0)
+        return '';
+    return parts
+        .map((part, i) => {
+        if (i === 0)
+            return part.toLowerCase();
+        if (part.length === 4) {
+            return part.charAt(0).toUpperCase() + part.slice(1).toLowerCase();
+        }
+        return part.toUpperCase();
+    })
+        .join('-');
+}
+function normalizeRegionCode(region) {
+    if (!region)
+        return '';
+    const upper = String(region).trim().toUpperCase();
+    return /^[A-Z]{2}$/.test(upper) ? upper : '';
 }
 class AppPlatformAdapter {
-    constructor(sys, getSceneName, getDeviceInfo) {
+    constructor(sys, getSceneName, getDeviceInfo, isOptedOut) {
         this._currentSceneName = '';
         this._previousSceneName = '';
+        this._devicePrefetchStarted = false;
         this._sys = sys;
         this._getSceneName = getSceneName;
+        this._isOptedOut = isOptedOut;
         this._nativeBridge = new NativeBridge(sys);
         if (getDeviceInfo) {
             this._nativeBridge.setUserFn(getDeviceInfo);
         }
+        if (!this._isOptedOut?.()) {
+            this._startDevicePrefetch();
+        }
+    }
+    onOptIn() {
+        this._startDevicePrefetch();
+    }
+    dispose() {
+        this._nativeBridge.dispose();
+    }
+    _startDevicePrefetch() {
+        if (this._devicePrefetchStarted)
+            return;
+        this._devicePrefetchStarted = true;
         Promise.resolve()
             .then(() => this._nativeBridge.getDeviceInfoAsync())
             .catch(() => {
@@ -1632,7 +1835,7 @@ class AppPlatformAdapter {
             $os_version: formatOsVersion(this._sys.osVersion || ''),
             $screen_width: this._resolveScreenWidth(),
             $screen_height: this._resolveScreenHeight(),
-            $language: this._sys.language || '',
+            $language: normalizeBcp47Language(this._sys.language || ''),
             $timezone_offset: -new Date().getTimezoneOffset() * 60,
             $title: '',
             $url: '',
@@ -1658,10 +1861,17 @@ class AppPlatformAdapter {
             $device_id: deviceInfo.deviceId || this._sys.deviceId || '',
             $app_id: deviceInfo.appId || this._sys.appId || '',
             $app_name: deviceInfo.appName || this._sys.appName || '',
-            $region: deviceInfo.region || this._sys.region || '',
+            $language: normalizeBcp47Language(deviceInfo.language || this._sys.language || ''),
         };
+        const region = normalizeRegionCode(deviceInfo.region || this._sys.region || '');
+        if (region) {
+            props.$region = region;
+        }
         if (networkType) {
-            props.$network_type = normalizeNetworkType(networkType);
+            const normalized = normalizeNetworkType(networkType);
+            if (normalized) {
+                props.$network_type = normalized;
+            }
             props.$wifi = isWifiNetworkType(networkType);
         }
         if (currentScene) {
@@ -1738,19 +1948,6 @@ class AppPlatformAdapter {
         return 'game';
     }
 }
-function normalizeMPNetworkType(networkType) {
-    if (!networkType)
-        return '';
-    const lower = networkType.toLowerCase();
-    if (lower === 'wifi')
-        return 'wifi';
-    if (lower === 'none' || lower === 'unknown')
-        return '';
-    if (lower === '2g' || lower === '3g' || lower === '4g' || lower === '5g') {
-        return lower.toUpperCase();
-    }
-    return networkType;
-}
 class MPPlatformAdapter {
     constructor(sys, getSceneName) {
         this._systemInfo = null;
@@ -1795,7 +1992,7 @@ class MPPlatformAdapter {
             this._asyncNetworkInflight = true;
             sdk.getNetworkType({
                 success: (res) => {
-                    this._asyncNetworkType = normalizeMPNetworkType(res?.networkType || '');
+                    this._asyncNetworkType = normalizeNetworkType(res?.networkType || '');
                     this._asyncNetworkCacheTime = Date.now();
                     this._asyncNetworkInflight = false;
                 },
@@ -1817,7 +2014,7 @@ class MPPlatformAdapter {
             if (!sdk || typeof sdk.onNetworkTypeChange !== 'function')
                 return;
             this._networkChangeHandler = (res) => {
-                this._asyncNetworkType = normalizeMPNetworkType(res?.networkType || '');
+                this._asyncNetworkType = normalizeNetworkType(res?.networkType || '');
                 this._asyncNetworkCacheTime = Date.now();
             };
             sdk.onNetworkTypeChange(this._networkChangeHandler);
@@ -1868,7 +2065,7 @@ class MPPlatformAdapter {
             props.$model = info.model || this._sys.model || '';
             props.$screen_width = info.screenWidth || this._sys.screenWidth || 0;
             props.$screen_height = info.screenHeight || this._sys.screenHeight || 0;
-            props.$language = info.language || this._sys.language || '';
+            props.$language = normalizeBcp47Language(info.language || this._sys.language || '');
             props.$brand = info.brand || this._sys.brand || '';
             props.$manufacturer = info.manufacturer || info.brand || this._sys.manufacturer || '';
         }
@@ -1878,12 +2075,15 @@ class MPPlatformAdapter {
             props.$model = this._sys.model || '';
             props.$screen_width = this._sys.screenWidth || 0;
             props.$screen_height = this._sys.screenHeight || 0;
-            props.$language = this._sys.language || '';
+            props.$language = normalizeBcp47Language(this._sys.language || '');
             props.$brand = this._sys.brand || '';
             props.$manufacturer = this._sys.manufacturer || '';
         }
         props.$timezone_offset = -new Date().getTimezoneOffset() * 60;
-        props.$network_type = this._resolveNetworkType();
+        const networkType = this._resolveNetworkType();
+        if (networkType) {
+            props.$network_type = networkType;
+        }
         const mpInfo = this._accountInfo?.miniProgram;
         props.$app_id = mpInfo?.appId || '';
         props.$app_version = mpInfo?.version || '';
@@ -1923,9 +2123,11 @@ class MPPlatformAdapter {
         return props;
     }
     getDynamicProperties() {
-        const props = {
-            $network_type: this._resolveNetworkType(),
-        };
+        const networkType = this._resolveNetworkType();
+        const props = {};
+        if (networkType) {
+            props.$network_type = networkType;
+        }
         let pathOnly = '';
         let queryStr = '';
         try {
@@ -2009,7 +2211,7 @@ class H5PlatformAdapter {
             $model: this._sys.model || '',
             $screen_width: this._sys.screenWidth || 0,
             $screen_height: this._sys.screenHeight || 0,
-            $language: this._sys.language || '',
+            $language: normalizeBcp47Language(this._sys.language || ''),
             $timezone_offset: -new Date().getTimezoneOffset() * 60,
         };
         try {
@@ -2025,7 +2227,7 @@ class H5PlatformAdapter {
                     }
                 }
                 if (g.navigator.language) {
-                    props.$language = g.navigator.language;
+                    props.$language = normalizeBcp47Language(g.navigator.language);
                 }
             }
             if ((!props.$screen_width || !props.$screen_height) && g.screen) {
@@ -2066,6 +2268,14 @@ class H5PlatformAdapter {
         const props = {};
         try {
             const g = globalThis;
+            const conn = g.navigator?.connection;
+            if (conn) {
+                const raw = conn.type || conn.effectiveType || '';
+                const networkType = normalizeNetworkType(raw);
+                if (networkType) {
+                    props.$network_type = networkType;
+                }
+            }
             if (g.window && g.window.location) {
                 props.$url = g.window.location.href || '';
                 props.$pathname = g.window.location.pathname || '';
@@ -2270,6 +2480,9 @@ class GameLifecyclePlugin {
         this._hideEventName = GAME_EVENT_HIDE;
         this._destroyed = false;
         this._initTimer = null;
+        this._appEndTimer = null;
+        this._h5BeforeUnloadHandler = null;
+        this._h5LoadHandler = null;
         this._store = opts.store;
         this._send = opts.send;
         this._autoCapture = opts.autoCapture;
@@ -2281,6 +2494,10 @@ class GameLifecyclePlugin {
         this._isOptedOut = opts.isOptedOut ?? (() => false);
     }
     init() {
+        if (this._enableShareTrack) {
+            this._initShareTracking();
+        }
+        this._replayPendingAppEndAtLaunch();
         if (!this._autoCapture)
             return;
         const platformType = this._platformAdapter.getPlatformType();
@@ -2306,9 +2523,6 @@ class GameLifecyclePlugin {
             }
             else if (platformType === 'minigame') {
                 this._initMinigameLifecycle();
-                if (this._enableShareTrack) {
-                    this._initShareTracking();
-                }
             }
             else {
                 this._initH5Lifecycle();
@@ -2336,10 +2550,9 @@ class GameLifecyclePlugin {
         this._pageShowTimestamp = Date.now();
         try {
             const g = globalThis;
-            if (g.window) {
-                if (typeof g.window.addEventListener === 'function') {
-                    g.window.addEventListener('beforeunload', this._handleH5PageLeave.bind(this));
-                }
+            if (g.window && typeof g.window.addEventListener === 'function') {
+                this._h5BeforeUnloadHandler = () => this._handleH5PageLeave();
+                g.window.addEventListener('beforeunload', this._h5BeforeUnloadHandler);
             }
         }
         catch {
@@ -2357,6 +2570,7 @@ class GameLifecyclePlugin {
         }
         try {
             if (g.window && typeof g.window.addEventListener === 'function') {
+                this._h5LoadHandler = fire;
                 g.window.addEventListener('load', fire);
             }
             else {
@@ -2400,8 +2614,22 @@ class GameLifecyclePlugin {
         this._enqueueEvent(event);
     }
     _handleAppShow() {
+        const pending = this._store.getPendingAppEnd();
+        if (pending) {
+            this._clearAppEndTimer();
+            this._store.clearPendingAppEnd();
+        }
         if (this._isOptedOut())
             return;
+        if (pending && Date.now() - pending.hideTs < CONSTANTS.APP_END_DEBOUNCE_MS) {
+            const foregroundMs = pending.startTs > 0 ? Math.max(0, pending.hideTs - pending.startTs) : 0;
+            this._startTimestamp = Date.now() - foregroundMs;
+            return;
+        }
+        if (pending) {
+            this._enqueueEvent(pending.event);
+            this._flushImmediate();
+        }
         this._startTimestamp = Date.now();
         const event = this._send.sendEvent('$AppStart');
         this._enqueueEvent(event);
@@ -2409,12 +2637,50 @@ class GameLifecyclePlugin {
     _handleAppHide() {
         if (this._isOptedOut())
             return;
-        const duration = this._startTimestamp > 0 ? Math.floor((Date.now() - this._startTimestamp) / 1000) : 0;
+        if (this._store.getPendingAppEnd()) {
+            this._flushPendingAppEnd();
+        }
+        const hideTs = Date.now();
+        const duration = this._startTimestamp > 0 ? Number(((hideTs - this._startTimestamp) / 1000).toFixed(3)) : 0;
         const event = this._send.sendEvent('$AppEnd', {
             $event_duration: duration,
         });
-        this._enqueueEvent(event);
+        if (!this._store.savePendingAppEnd(event, hideTs, this._startTimestamp)) {
+            this._enqueueEvent(event);
+            this._flushImmediate();
+            return;
+        }
+        this._clearAppEndTimer();
+        this._appEndTimer = setTimeout(() => {
+            this._appEndTimer = null;
+            if (this._destroyed)
+                return;
+            this._flushPendingAppEnd();
+        }, CONSTANTS.APP_END_DEBOUNCE_MS);
         this._flushImmediate();
+    }
+    _replayPendingAppEndAtLaunch() {
+        if (this._platformAdapter.getPlatformType() !== 'app')
+            return;
+        this._flushPendingAppEnd();
+    }
+    _flushPendingAppEnd() {
+        const pending = this._store.getPendingAppEnd();
+        if (!pending)
+            return;
+        if (this._isOptedOut()) {
+            this._store.clearPendingAppEnd();
+            return;
+        }
+        this._enqueueEvent(pending.event);
+        this._store.clearPendingAppEnd();
+        this._flushImmediate();
+    }
+    _clearAppEndTimer() {
+        if (this._appEndTimer) {
+            clearTimeout(this._appEndTimer);
+            this._appEndTimer = null;
+        }
     }
     _extractLaunchProps() {
         const launchOptions = this._platformAdapter.getLaunchOptions();
@@ -2446,7 +2712,9 @@ class GameLifecyclePlugin {
     _handleMPHide() {
         if (this._isOptedOut())
             return;
-        const duration = this._startTimestamp > 0 ? Math.floor((Date.now() - this._startTimestamp) / 1000) : 0;
+        const duration = this._startTimestamp > 0
+            ? Number(((Date.now() - this._startTimestamp) / 1000).toFixed(3))
+            : 0;
         const event = this._send.sendEvent('$MPHide', {
             $event_duration: duration,
         });
@@ -2459,32 +2727,23 @@ class GameLifecyclePlugin {
         const event = this._send.sendEvent('$PageView');
         this._enqueueEvent(event);
     }
-    _scheduleH5PageLoad() {
-        const g = globalThis;
-        if (g.document?.readyState === 'complete') {
-            this._trackH5PageLoad();
-            return;
-        }
-        try {
-            if (g.window && typeof g.window.addEventListener === 'function') {
-                g.window.addEventListener('load', () => {
-                    this._trackH5PageLoad();
-                });
-            }
-        }
-        catch {
-            this._trackH5PageLoad();
-        }
-    }
     _trackH5PageLoad() {
         if (this._isOptedOut())
             return;
         const g = globalThis;
         const loadStart = g.performance?.timing?.navigationStart;
-        const loadEnd = g.performance?.timing?.loadEventEnd;
+        const loadEnd = g.performance?.timing?.loadEventEnd || g.performance?.timing?.loadEventStart;
         const props = {};
         if (loadStart && loadEnd) {
-            props.$event_duration = Math.floor((loadEnd - loadStart) / 1000);
+            props.$event_duration = Number(((loadEnd - loadStart) / 1000).toFixed(3));
+        }
+        try {
+            const nav = g.performance?.getEntriesByType?.('navigation')?.[0];
+            if (nav && typeof nav.transferSize === 'number' && nav.transferSize > 0) {
+                props.$page_resource_size = Number((nav.transferSize / 1024).toFixed(3));
+            }
+        }
+        catch {
         }
         const event = this._send.sendEvent('$PageLoad', props);
         this._enqueueEvent(event);
@@ -2493,7 +2752,7 @@ class GameLifecyclePlugin {
         if (this._isOptedOut())
             return;
         const duration = this._pageShowTimestamp > 0
-            ? Math.min(Math.floor((Date.now() - this._pageShowTimestamp) / 1000), 432000)
+            ? Number((Math.min(Date.now() - this._pageShowTimestamp, 432000000) / 1000).toFixed(3))
             : 0;
         const event = this._send.sendEvent('$PageLeave', {
             $event_duration: duration,
@@ -2511,8 +2770,7 @@ class GameLifecyclePlugin {
                     return;
                 const from = res && typeof res.from === 'string' ? res.from : 'unknown';
                 const event = this._send.sendEvent('$MPShare', {
-                    $share_from: from,
-                    $channel: 'minigame',
+                    $share_method: from,
                 });
                 this._enqueueEvent(event);
                 this._flushImmediate();
@@ -2529,6 +2787,7 @@ class GameLifecyclePlugin {
             clearTimeout(this._initTimer);
             this._initTimer = null;
         }
+        this._clearAppEndTimer();
         if (this._ccGame && typeof this._ccGame.off === 'function') {
             if (this._onShowHandler)
                 this._ccGame.off(this._showEventName, this._onShowHandler);
@@ -2545,9 +2804,24 @@ class GameLifecyclePlugin {
             catch {
             }
         }
+        try {
+            const g = globalThis;
+            if (g.window && typeof g.window.removeEventListener === 'function') {
+                if (this._h5BeforeUnloadHandler) {
+                    g.window.removeEventListener('beforeunload', this._h5BeforeUnloadHandler);
+                }
+                if (this._h5LoadHandler) {
+                    g.window.removeEventListener('load', this._h5LoadHandler);
+                }
+            }
+        }
+        catch {
+        }
         this._onShowHandler = null;
         this._onHideHandler = null;
         this._onShareHandler = null;
+        this._h5BeforeUnloadHandler = null;
+        this._h5LoadHandler = null;
     }
 }
 GameLifecyclePlugin.NAME = 'GameLifecycle';
@@ -3129,6 +3403,147 @@ function enrichIosFrames(frames, images) {
     catch {
     }
 }
+const COCOA_SYSTEM_PREFIXES = [
+    'Foundation',
+    'UIKit',
+    'UIKitCore',
+    'AppKit',
+    'CoreFoundation',
+    'CoreGraphics',
+    'CoreData',
+    'CoreLocation',
+    'CoreMotion',
+    'CoreServices',
+    'CoreText',
+    'AVFoundation',
+    'Metal',
+    'MetalKit',
+    'SwiftUI',
+    'SwiftUICore',
+    'Combine',
+    'QuartzCore',
+    'Security',
+    'SystemConfiguration',
+    'CFNetwork',
+    'WebKit',
+    'GraphicsServices',
+    'IOKit',
+    'Gestures',
+    'UIKitMacHelper',
+    'Accessibility',
+    'AccessibilityUtilities',
+    'UpdateCycle',
+    'TextInput',
+    'UIFoundation',
+    'BackBoardServices',
+    'FrontBoardServices',
+    'SpringBoardServices',
+    'RunningBoardServices',
+    'JavaScriptCore',
+    'libsystem_kernel.dylib',
+    'libsystem_pthread.dylib',
+    'libsystem_c.dylib',
+    'libsystem_malloc.dylib',
+    'libsystem_platform.dylib',
+    'libdispatch.dylib',
+    'libswift',
+    'libobjc',
+    'libc++abi.dylib',
+    'dyld',
+];
+const JAVA_SYSTEM_PREFIXES = [
+    'java.',
+    'javax.',
+    'android.',
+    'androidx.',
+    'kotlin.',
+    'kotlinx.',
+    'dalvik.',
+    'com.android.',
+    'com.google.android.',
+    'libcore.',
+];
+const NATIVE_SYSTEM_PREFIXES = [
+    'ld-musl',
+    'libc.so',
+    'libc++.so',
+    'libc++abi.so',
+    'libunwind.so',
+    'libbacktrace.so',
+    'libbase.so',
+    'libcutils.so',
+    'libutils.so',
+    'liblog.so',
+    'libbinder.so',
+    'libnativewindow.so',
+    'libEGL.so',
+    'libGLESv2.so',
+    'libvulkan.so',
+    'libclang_rt',
+];
+function matchesPrefixList(target, prefixes) {
+    for (const p of prefixes) {
+        if (target.indexOf(p) === 0)
+            return true;
+    }
+    return false;
+}
+function sanitizePrefixList(list) {
+    if (!Array.isArray(list))
+        return [];
+    const out = [];
+    for (const item of list) {
+        if (typeof item !== 'string')
+            continue;
+        const trimmed = item.trim();
+        if (trimmed.length > 0)
+            out.push(trimmed);
+    }
+    return out;
+}
+function resolveInApp(frame, includes, excludes) {
+    if (frame.platform === 'cocoa' || frame.platform === 'native') {
+        const module = frame.module;
+        if (typeof module !== 'string' || module.length === 0 || module === 'unknown')
+            return false;
+    }
+    const module = typeof frame.module === 'string' ? frame.module : '';
+    const filename = typeof frame.filename === 'string' ? frame.filename : '';
+    const target = module || filename;
+    if (matchesPrefixList(target, includes))
+        return true;
+    if (matchesPrefixList(target, excludes))
+        return false;
+    if (frame.platform === 'cocoa' && matchesPrefixList(target, COCOA_SYSTEM_PREFIXES))
+        return false;
+    if (frame.platform === 'java' && matchesPrefixList(target, JAVA_SYSTEM_PREFIXES))
+        return false;
+    if (frame.platform === 'native' && matchesPrefixList(target, NATIVE_SYSTEM_PREFIXES)) {
+        return false;
+    }
+    return true;
+}
+function markInAppFrames(frames, exceptionConfig) {
+    try {
+        if (!Array.isArray(frames) || frames.length === 0)
+            return;
+        const config = typeof exceptionConfig === 'object' && exceptionConfig !== null ? exceptionConfig : {};
+        const includes = sanitizePrefixList(config.inAppIncludes);
+        const excludes = sanitizePrefixList(config.inAppExcludes);
+        for (const frame of frames) {
+            if (typeof frame !== 'object' || frame === null)
+                continue;
+            try {
+                frame.in_app = resolveInApp(frame, includes, excludes);
+            }
+            catch {
+                frame.in_app = false;
+            }
+        }
+    }
+    catch {
+    }
+}
 
 function readWatermark(storage) {
     if (!storage)
@@ -3200,6 +3615,7 @@ class ExceptionPlugin {
         this._safeStorage = opts.safeStorage;
         this._enableCrashTrack = !!opts.enableCrashTrack;
         this._enableErrorTrack = !!opts.enableErrorTrack;
+        this._exceptionConfig = opts.exceptionConfig ?? {};
         this._enqueueEvent = opts.enqueueEvent;
         this._flushImmediate = opts.flushImmediate;
         this._isOptedOut = opts.isOptedOut ?? (() => false);
@@ -3312,6 +3728,7 @@ class ExceptionPlugin {
         }
         const frames = parseExceptionFrames(normalized.stack);
         enrichIosFrames(frames, images);
+        markInAppFrames(frames, this._exceptionConfig);
         const props = {
             ...(properties || {}),
             $exception_level: level,
@@ -3553,8 +3970,8 @@ class ABTestPlugin {
     constructor(opts) {
         this.NAME = 'ABTest';
         this._fetchingPromise = null;
+        this._fetchTimeoutTimer = null;
         this._refreshTimer = null;
-        this._lastFetchTime = 0;
         this._store = opts.store;
         this._send = opts.send;
         this._enableAB = opts.enableAB;
@@ -3588,15 +4005,29 @@ class ABTestPlugin {
         if (this._fetchingPromise) {
             return this._fetchingPromise;
         }
-        const now = Date.now();
-        if (now - this._lastFetchTime < CONSTANTS.MIN_AB_REFRESH_INTERVAL) {
-            return Promise.resolve([]);
-        }
         this._fetchingPromise = this._fetchFromServer();
         return this._fetchingPromise;
     }
     _fetchFromServer() {
         return new Promise((resolve) => {
+            let settled = false;
+            const settle = (fn) => {
+                if (settled)
+                    return;
+                settled = true;
+                if (this._fetchTimeoutTimer) {
+                    clearTimeout(this._fetchTimeoutTimer);
+                    this._fetchTimeoutTimer = null;
+                }
+                fn();
+            };
+            this._fetchTimeoutTimer = setTimeout(() => {
+                settle(() => {
+                    this._fetchingPromise = null;
+                    logger.warn('AB fetch timeout, resolve with empty results');
+                    resolve([]);
+                });
+            }, CONSTANTS.REQUEST_WATCHDOG_DELAY_MS);
             const requestData = {
                 user: {
                     anon_id: this._store.getAnonId(),
@@ -3614,19 +4045,20 @@ class ABTestPlugin {
                     SourceToken: this._sourceToken,
                 },
                 callback: (response) => {
-                    this._fetchingPromise = null;
-                    this._lastFetchTime = Date.now();
-                    if (response.statusCode === 200 && response.json?.code === 0) {
-                        const results = response.json?.data?.results || [];
-                        if (results.length > 0) {
-                            this._store.saveABData(results);
+                    settle(() => {
+                        this._fetchingPromise = null;
+                        if (response.statusCode === 200 && response.json?.code === 0) {
+                            const results = response.json?.data?.results || [];
+                            if (results.length > 0) {
+                                this._store.saveABData(results);
+                            }
+                            resolve(results);
                         }
-                        resolve(results);
-                    }
-                    else {
-                        logger.warn('AB fetch failed:', response.statusCode);
-                        resolve([]);
-                    }
+                        else {
+                            logger.warn('AB fetch failed:', response.statusCode);
+                            resolve([]);
+                        }
+                    });
                 },
             });
         });
@@ -3717,6 +4149,10 @@ class ABTestPlugin {
             clearInterval(this._refreshTimer);
             this._refreshTimer = null;
         }
+        if (this._fetchTimeoutTimer) {
+            clearTimeout(this._fetchTimeoutTimer);
+            this._fetchTimeoutTimer = null;
+        }
         this._fetchingPromise = null;
     }
 }
@@ -3739,6 +4175,7 @@ class Sensorswave {
         this._apiHost = '';
         this._optOutCapturing = false;
         this._persistOptOut = false;
+        this._platformAdapter = null;
         this._requestFn = this._defaultRequestFn.bind(this);
     }
     init(sourceToken, config) {
@@ -3772,7 +4209,8 @@ class Sensorswave {
         this._queue = new PersistentQueue(safeStorage);
         this._batchSender = new BatchSender(this._queue, this._requestFn, mergedConfig.maxBatchSize, mergedConfig.flushInterval);
         const platformType = detectPlatform(ccSys);
-        const platformAdapter = createPlatformAdapter(platformType, ccSys, mergedConfig.getSceneName, platformType === 'app' ? mergedConfig.getDeviceInfo : undefined);
+        const platformAdapter = createPlatformAdapter(platformType, ccSys, mergedConfig.getSceneName, platformType === 'app' ? mergedConfig.getDeviceInfo : undefined, () => this._optOutCapturing);
+        this._platformAdapter = platformAdapter;
         this._presetProps = new PresetProperties(platformAdapter);
         this._sessionManager = new SessionManager(safeStorage);
         this._send = new Send(this._store, this._presetProps, this._sessionManager);
@@ -3801,6 +4239,7 @@ class Sensorswave {
             safeStorage,
             enableCrashTrack: mergedConfig.enableCrashTrack,
             enableErrorTrack: mergedConfig.enableErrorTrack,
+            exceptionConfig: mergedConfig.exceptionConfig,
             isOptedOut: () => this._optOutCapturing,
             enqueueEvent: (event) => this._enqueuePluginEvent(event),
             flushImmediate: () => {
@@ -3846,6 +4285,14 @@ class Sensorswave {
             return;
         }
         const event = this._send.sendEvent(eventData.event, eventData.properties, eventData.user_properties, eventData.subject_properties);
+        if (eventData.time !== undefined)
+            event.time = eventData.time;
+        if (eventData.trace_id !== undefined)
+            event.trace_id = eventData.trace_id;
+        if (eventData.anon_id !== undefined)
+            event.anon_id = eventData.anon_id;
+        if (eventData.login_id !== undefined)
+            event.login_id = eventData.login_id;
         this._enqueueEvent(event);
     }
     trackException(throwable, properties) {
@@ -3932,6 +4379,10 @@ class Sensorswave {
     clearCommonProperties(keys) {
         if (!this._ensureInited())
             return;
+        if (keys !== undefined && !Array.isArray(keys)) {
+            logger.warn('clearCommonProperties() requires an array of keys');
+            return;
+        }
         this._store.clearCommonProperties(keys);
     }
     profileSet(props) {
@@ -3950,6 +4401,10 @@ class Sensorswave {
         this._profileOp('$union', props);
     }
     profileUnset(keys) {
+        if (!Array.isArray(keys)) {
+            logger.warn('profileUnset() requires an array of keys');
+            return;
+        }
         const unsetProps = {};
         for (const key of keys) {
             unsetProps[key] = null;
@@ -4023,6 +4478,12 @@ class Sensorswave {
                 this._store.setOptOut(false);
             if (this._batchSender)
                 this._batchSender.resume();
+            try {
+                this._platformAdapter?.onOptIn?.();
+            }
+            catch (e) {
+                logger.warn('Failed to resume device info prefetch on opt-in:', e);
+            }
             const utmPlugin = this._pluginManager?.getPlugin('UTM');
             if (utmPlugin) {
                 try {
@@ -4044,6 +4505,13 @@ class Sensorswave {
         if (this._batchSender) {
             this._batchSender.destroy();
         }
+        try {
+            this._platformAdapter?.dispose?.();
+        }
+        catch (e) {
+            logger.warn('Failed to dispose platform adapter:', e);
+        }
+        this._platformAdapter = null;
         this._emitter.removeAllListeners();
         this.inited = false;
         this._optOutCapturing = false;
@@ -4142,6 +4610,12 @@ class Sensorswave {
                     }
                 }
                 config.callback?.(response);
+            };
+            xhr.onerror = () => {
+                config.callback?.({ statusCode: 0, text: 'Network error' });
+            };
+            xhr.ontimeout = () => {
+                config.callback?.({ statusCode: 0, text: 'Request timeout' });
             };
             xhr.send(config.data ? JSON.stringify(config.data) : null);
         }

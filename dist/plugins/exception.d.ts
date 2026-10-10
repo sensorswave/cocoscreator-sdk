@@ -1,4 +1,4 @@
-import type { IPlugin, SensorswaveSendEvent } from '../types';
+import type { IPlugin, SensorswaveSendEvent, ExceptionConfig } from '../types';
 import type { IPlatformAdapter } from '../platform/interface';
 import { Send } from '../basic/send';
 import { SafeStorage } from '../utils/safe-storage';
@@ -8,6 +8,7 @@ export interface ExceptionOpts {
     safeStorage: SafeStorage | null;
     enableCrashTrack: boolean;
     enableErrorTrack: boolean;
+    exceptionConfig?: ExceptionConfig;
     enqueueEvent: (event: SensorswaveSendEvent) => void;
     flushImmediate: () => void;
     isOptedOut?: () => boolean;
@@ -20,6 +21,7 @@ export declare class ExceptionPlugin implements IPlugin {
     private _safeStorage;
     private _enableCrashTrack;
     private _enableErrorTrack;
+    private _exceptionConfig;
     private _enqueueEvent;
     private _flushImmediate;
     private _isOptedOut;
