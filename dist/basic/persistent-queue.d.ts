@@ -16,5 +16,6 @@ export declare class PersistentQueue {
     get size(): number;
     incrementRetryCount(id: string): void;
     incrementRetryCounts(ids: string[]): void;
+    moveToTail(ids: string[]): void;
     markDead(id: string): void;
 }

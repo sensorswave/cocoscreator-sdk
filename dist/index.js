@@ -1,4 +1,4 @@
-const SDK_VERSION = '1.4.0';
+const SDK_VERSION = '1.4.1';
 
 const DEFAULT_CONFIG = {
     debug: false,
@@ -519,6 +519,20 @@ class PersistentQueue {
         if (changed)
             this._persist();
     }
+    moveToTail(ids) {
+        if (ids.length === 0)
+            return;
+        const idSet = new Set(ids);
+        const moved = [];
+        const kept = [];
+        for (const item of this._queue) {
+            (idSet.has(item.id) ? moved : kept).push(item);
+        }
+        if (moved.length === 0)
+            return;
+        this._queue = [...kept, ...moved];
+        this._persist();
+    }
     markDead(id) {
         const item = this._queue.find((i) => i.id === id);
         if (item) {
@@ -663,6 +677,7 @@ class BatchSender {
         else {
             this._consecutiveFailures++;
             this._queue.incrementRetryCounts(ids);
+            this._queue.moveToTail(ids);
             this._warnExcessiveRetries(ids);
         }
         if (statusCode === 200 && this._queue.size > 0) {
