@@ -1,4 +1,4 @@
-const SDK_VERSION = '1.4.1';
+const SDK_VERSION = '1.4.2';
 
 const DEFAULT_CONFIG = {
     debug: false,
@@ -1757,6 +1757,41 @@ function formatOsVersion(version) {
         .replace(/^OHOS[\s-]*/i, '')
         .trim();
 }
+const WINDOWS_NT_VERSION_MAP = {
+    '5.0': '2000',
+    '5.1': 'XP',
+    '5.2': 'XP',
+    '6.0': 'Vista',
+    '6.1': '7',
+    '6.2': '8',
+    '6.3': '8.1',
+    '10.0': '10',
+};
+function detectOsInfoFromUa(ua) {
+    if (typeof ua !== 'string' || ua.length === 0)
+        return { os: '', version: '' };
+    const iosMatch = /(?:iPhone|iPad|iPod).*?OS (\d+(?:_\d+)*)/.exec(ua);
+    if (iosMatch)
+        return { os: 'iOS', version: iosMatch[1].replace(/_/g, '.') };
+    const androidMatch = /Android (\d+(?:\.\d+)*)/i.exec(ua);
+    if (androidMatch)
+        return { os: 'Android', version: androidMatch[1] };
+    const macMatch = /Mac OS X (\d+(?:[_.]\d+)*)/i.exec(ua);
+    if (macMatch)
+        return { os: 'Mac OS X', version: macMatch[1].replace(/_/g, '.') };
+    if (/Windows/i.test(ua)) {
+        if (/arm/i.test(ua))
+            return { os: 'Windows', version: 'RT' };
+        const ntMatch = /Windows NT ([\d.]+)/i.exec(ua);
+        const version = ntMatch ? WINDOWS_NT_VERSION_MAP[ntMatch[1]] || ntMatch[1] : '';
+        return { os: 'Windows', version };
+    }
+    if (/CrOS/i.test(ua))
+        return { os: 'Chrome OS', version: '' };
+    if (/Linux|debian/i.test(ua))
+        return { os: 'Linux', version: '' };
+    return { os: '', version: '' };
+}
 function normalizeNetworkType(networkType) {
     if (!networkType)
         return '';
@@ -2197,18 +2232,18 @@ class MPPlatformAdapter {
     }
 }
 const BROWSER_VERSION_REGEXES = {
-    Edge: [/Edge?\/(\d+(\.\d+)?)/],
-    Chrome: [/(Chrome|CrMo)\/(\d+(\.\d+)?)/],
-    'Chrome iOS': [/CriOS\/(\d+(\.\d+)?)/],
-    Firefox: [/Firefox\/(\d+(\.\d+)?)/],
-    'Firefox iOS': [/FxiOS\/(\d+(\.\d+)?)/],
-    Safari: [/Version\/(\d+(\.\d+)?)/],
-    'Mobile Safari': [/Version\/(\d+(\.\d+)?)/],
-    Opera: [/(Opera|OPR)\/(\d+(\.\d+)?)/],
-    'Opera Mini': [/OPR\/(\d+(\.\d+)?)/],
-    'UC Browser': [/(UCBrowser|UCWEB)\/(\d+(\.\d+)?)/],
-    'Samsung Internet': [/SamsungBrowser\/(\d+(\.\d+)?)/],
-    'Android Mobile': [/android\s(\d+(\.\d+)?)/i],
+    Edge: [/Edge?\/(\d+(?:\.\d+)*)/],
+    Chrome: [/(Chrome|CrMo)\/(\d+(?:\.\d+)*)/],
+    'Chrome iOS': [/CriOS\/(\d+(?:\.\d+)*)/],
+    Firefox: [/Firefox\/(\d+(?:\.\d+)*)/],
+    'Firefox iOS': [/FxiOS\/(\d+(?:\.\d+)*)/],
+    Safari: [/Version\/(\d+(?:\.\d+)*)/],
+    'Mobile Safari': [/Version\/(\d+(?:\.\d+)*)/],
+    Opera: [/(Opera|OPR)\/(\d+(?:\.\d+)*)/],
+    'Opera Mini': [/OPR\/(\d+(?:\.\d+)*)/],
+    'UC Browser': [/(UCBrowser|UCWEB)\/(\d+(?:\.\d+)*)/],
+    'Samsung Internet': [/SamsungBrowser\/(\d+(?:\.\d+)*)/],
+    'Android Mobile': [/android\s(\d+(?:\.\d+)*)/i],
 };
 class H5PlatformAdapter {
     constructor(sys) {
@@ -2236,6 +2271,13 @@ class H5PlatformAdapter {
                     const ua = g.navigator.userAgent;
                     props.$browser = this._detectBrowser(ua);
                     props.$browser_version = this._detectBrowserVersion(ua);
+                    if (!props.$os || !props.$os_version) {
+                        const uaOs = detectOsInfoFromUa(ua);
+                        if (!props.$os && uaOs.os)
+                            props.$os = formatOs(uaOs.os);
+                        if (!props.$os_version && uaOs.version)
+                            props.$os_version = formatOsVersion(uaOs.version);
+                    }
                     const detectedDevice = this._detectDevice(ua);
                     if (detectedDevice) {
                         props.$model = detectedDevice;
@@ -2283,14 +2325,6 @@ class H5PlatformAdapter {
         const props = {};
         try {
             const g = globalThis;
-            const conn = g.navigator?.connection;
-            if (conn) {
-                const raw = conn.type || conn.effectiveType || '';
-                const networkType = normalizeNetworkType(raw);
-                if (networkType) {
-                    props.$network_type = networkType;
-                }
-            }
             if (g.window && g.window.location) {
                 props.$url = g.window.location.href || '';
                 props.$pathname = g.window.location.pathname || '';
@@ -2361,14 +2395,14 @@ class H5PlatformAdapter {
         const browser = this._detectBrowser(ua);
         const regexes = BROWSER_VERSION_REGEXES[browser];
         if (!regexes)
-            return 0;
+            return '';
         for (const regex of regexes) {
             const matches = ua.match(regex);
-            if (matches) {
-                return parseFloat(matches[matches.length - 2]);
+            if (matches && matches[matches.length - 1]) {
+                return matches[matches.length - 1];
             }
         }
-        return 0;
+        return '';
     }
     _detectDevice(ua) {
         if (/iPad/.test(ua))
@@ -2753,9 +2787,15 @@ class GameLifecyclePlugin {
             props.$event_duration = Number(((loadEnd - loadStart) / 1000).toFixed(3));
         }
         try {
-            const nav = g.performance?.getEntriesByType?.('navigation')?.[0];
-            if (nav && typeof nav.transferSize === 'number' && nav.transferSize > 0) {
-                props.$page_resource_size = Number((nav.transferSize / 1024).toFixed(3));
+            const entries = g.performance?.getEntries?.() || [];
+            let totalSize = 0;
+            for (const entry of entries) {
+                if (entry && typeof entry.transferSize === 'number') {
+                    totalSize += entry.transferSize;
+                }
+            }
+            if (totalSize > 0 && totalSize < 10737418240) {
+                props.$page_resource_size = Number((totalSize / 1024).toFixed(3));
             }
         }
         catch {
@@ -3525,10 +3565,10 @@ function resolveInApp(frame, includes, excludes) {
     const module = typeof frame.module === 'string' ? frame.module : '';
     const filename = typeof frame.filename === 'string' ? frame.filename : '';
     const target = module || filename;
-    if (matchesPrefixList(target, includes))
-        return true;
     if (matchesPrefixList(target, excludes))
         return false;
+    if (matchesPrefixList(target, includes))
+        return true;
     if (frame.platform === 'cocoa' && matchesPrefixList(target, COCOA_SYSTEM_PREFIXES))
         return false;
     if (frame.platform === 'java' && matchesPrefixList(target, JAVA_SYSTEM_PREFIXES))
